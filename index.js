@@ -610,7 +610,7 @@ app.get('/logs/latest', (req, res) => {
     });
 });
 
-// Fungsi untuk koneksi ke WhatsApp
+// Optimasi konfigurasi koneksi WhatsApp
 async function connectToWhatsApp() {
     try {
         logger.info('Starting WhatsApp connection...');
@@ -628,7 +628,7 @@ async function connectToWhatsApp() {
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 250,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
+            keepAliveIntervalMs: 15000, // Meningkatkan frekuensi keepAlive
             emitOwnEvents: true,
             generateHighQualityLinkPreview: true,
             browser: ['Chrome (Linux)', '', ''],
@@ -639,14 +639,31 @@ async function connectToWhatsApp() {
 
         sock.multi = true;
 
+        // Tambahkan sistem heartbeat yang lebih agresif
+        const heartbeatInterval = setInterval(async () => {
+            try {
+                if (sock?.user?.id) {
+                    await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
+                    connectionState.lastHeartbeat = Date.now();
+                    logger.info('Heartbeat sent successfully');
+                }
+            } catch (error) {
+                logger.warn('Heartbeat failed, attempting reconnect...', error);
+                clearInterval(heartbeatInterval);
+                await handleReconnection();
+            }
+        }, 30000); // Kirim heartbeat setiap 30 detik
+
         // Tambahkan error handler untuk socket
         sock.ev.on('error', async (err) => {
             logger.error('WhatsApp socket error:', err);
+            clearInterval(heartbeatInterval);
             if (!connectionState.isConnecting) {
                 await handleReconnection();
             }
         });
 
+        // Optimasi connection.update handler
         sock.ev.on('connection.update', async (update) => {
             try {
                 const { connection, lastDisconnect } = update;
@@ -656,6 +673,8 @@ async function connectToWhatsApp() {
                     const statusCode = lastDisconnect?.error?.output?.statusCode;
                     connectionState.connectionStatus = 'disconnected';
                     logger.warn(`Connection closed with status code: ${statusCode}`);
+
+                    clearInterval(heartbeatInterval);
 
                     if (statusCode === DisconnectReason.badSession) {
                         logger.error(`Bad Session File, Please Delete ${session} and Scan Again`);
@@ -679,11 +698,14 @@ async function connectToWhatsApp() {
                         await handleReconnection();
                     }
                 } else if (connection === 'open') {
-                    // Verifikasi koneksi sebelum menganggap terhubung
+                    // Verifikasi koneksi lebih ketat
                     try {
                         if (sock?.user?.id) {
-                            const pingMessage = getRandomPingMessage();
-                            await sock.sendMessage(sock.user.id, { text: pingMessage });
+                            // Kirim beberapa ping untuk memastikan koneksi stabil
+                            for (let i = 0; i < 3; i++) {
+                                await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
+                                await new Promise(resolve => setTimeout(resolve, 1000));
+                            }
 
                             logger.success('Connection opened and verified successfully');
                             connectionState.reconnectAttempts = 0;
@@ -749,7 +771,7 @@ const isConnected = () => {
 // Optimasi fungsi handleReconnection
 const handleReconnection = async () => {
     const now = Date.now();
-    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 10000) {
+    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 5000) {
         logger.info('Too soon to attempt reconnection, skipping...');
         return false;
     }
@@ -763,11 +785,12 @@ const handleReconnection = async () => {
         // Cek apakah user sudah logout
         if (sock?.user?.id) {
             try {
-                // Tunggu lebih lama sebelum mencoba ping
-                await new Promise(resolve => setTimeout(resolve, 5000));
+                // Kirim beberapa ping untuk memastikan koneksi stabil
+                for (let i = 0; i < 3; i++) {
+                    await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
 
-                const pingMessage = getRandomPingMessage();
-                await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Koneksi WhatsApp masih aktif');
                 connectionState.connectionStatus = 'connected';
                 connectionState.isConnecting = false;
@@ -781,11 +804,11 @@ const handleReconnection = async () => {
         await connectToWhatsApp();
 
         // Tunggu lebih lama untuk memastikan koneksi terbentuk
-        await new Promise(resolve => setTimeout(resolve, 15000));
+        await new Promise(resolve => setTimeout(resolve, 10000));
 
         // Coba beberapa kali untuk memverifikasi koneksi
         let attempts = 0;
-        const maxAttempts = 5; // Meningkatkan jumlah percobaan
+        const maxAttempts = 5;
         let lastError = null;
 
         while (attempts < maxAttempts) {
@@ -793,15 +816,16 @@ const handleReconnection = async () => {
                 if (!sock?.user?.id) {
                     logger.warn('User ID tidak tersedia, mencoba lagi...');
                     attempts++;
-                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    await new Promise(resolve => setTimeout(resolve, 3000));
                     continue;
                 }
 
-                // Tunggu lebih lama sebelum verifikasi
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                // Kirim beberapa ping untuk memastikan koneksi stabil
+                for (let i = 0; i < 3; i++) {
+                    await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
 
-                const pingMessage = getRandomPingMessage();
-                await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Reconnect berhasil dan koneksi terverifikasi');
                 connectionState.connectionStatus = 'connected';
                 connectionState.reconnectAttempts = 0;
@@ -816,8 +840,7 @@ const handleReconnection = async () => {
                 logger.warn(`Percobaan verifikasi koneksi ${attempts}/${maxAttempts} gagal:`, error);
 
                 if (attempts < maxAttempts) {
-                    // Tunggu lebih lama sebelum mencoba lagi
-                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    await new Promise(resolve => setTimeout(resolve, 3000));
                 }
             }
         }

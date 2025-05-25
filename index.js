@@ -796,87 +796,75 @@ async function connectToWhatsApp() {
                     clearInterval(verifyConnectionInterval);
 
                     if (statusCode === DisconnectReason.badSession) {
-                        logger.error(`Bad Session File, Please Delete ${session} and Scan Again`);
+                        logger.error(`Session tidak valid, silakan scan ulang QR Code`);
                         await handleLogout();
                     } else if (statusCode === DisconnectReason.connectionClosed ||
                         statusCode === DisconnectReason.connectionLost ||
                         statusCode === DisconnectReason.timedOut) {
-                        logger.warn("Connection lost, attempting to reconnect...");
+                        logger.warn("Koneksi terputus, mencoba reconnect...");
                         await handleReconnection();
                     } else if (statusCode === DisconnectReason.connectionReplaced) {
-                        // Cek session sebelum reconnect
-                        const sessionValid = await validateSession();
-                        if (sessionValid) {
-                            logger.info('Session masih valid, mencoba reconnect...');
-                            await handleReconnection();
-                        } else {
-                            logger.warn('Session tidak valid, melakukan logout...');
-                            await handleLogout();
-                        }
+                        logger.warn("Koneksi digantikan, mencoba reconnect...");
+                        await handleReconnection();
                     } else if (statusCode === DisconnectReason.loggedOut) {
-                        logger.error(`Device Logged Out, Please Delete ${session} and Scan Again.`);
+                        logger.error(`WhatsApp telah logout, silakan scan ulang QR Code`);
                         await handleLogout();
                     } else if (statusCode === DisconnectReason.restartRequired) {
-                        logger.warn("Restart Required, Restarting...");
+                        logger.warn("Perlu restart, mencoba reconnect...");
                         await handleReconnection();
                     } else {
                         logger.warn(`Unknown DisconnectReason: ${statusCode}`);
                         await handleReconnection();
                     }
                 } else if (connection === 'open') {
-                    // Reset connection tracker saat koneksi berhasil
+                    // Reset connection tracker
                     connectionTracker.connectionAttempts = 0;
                     connectionTracker.lastConnectionTime = Date.now();
                     connectionTracker.isReconnecting = false;
 
-                    // Verifikasi koneksi dan session
+                    // Verifikasi koneksi
                     try {
                         if (sock?.user?.id) {
                             const sessionValid = await validateSession();
                             if (sessionValid) {
-                                logger.success('Connection opened and session verified successfully');
+                                logger.success('Koneksi berhasil dan session terverifikasi');
                                 connectionState.reconnectAttempts = 0;
                                 connectionState.isAuthenticated = true;
                                 connectionState.connectionStatus = 'connected';
                                 connectionState.lastConnectionTime = Date.now();
+                                updateQR("connected");
 
                                 // Coba kirim ulang pesan yang gagal
                                 await handleFailedMessages();
                             } else {
-                                logger.warn('Connection opened but session invalid');
+                                logger.warn('Koneksi berhasil tapi session tidak valid');
                                 await handleLogout();
                             }
                         } else {
-                            logger.warn('Connection opened but user ID not available');
+                            logger.warn('Koneksi berhasil tapi user ID tidak tersedia');
                             await handleLogout();
                         }
                     } catch (error) {
-                        logger.error('Failed to verify connection and session:', error);
+                        logger.error('Gagal verifikasi koneksi:', error);
                         await handleLogout();
                     }
                 }
 
-                if (update.qr && !connectionState.isAuthenticated) {
-                    // Cek session sebelum menampilkan QR
-                    const sessionValid = await validateSession();
-                    if (sessionValid) {
-                        logger.info('Session valid, tidak perlu menampilkan QR');
-                        return;
+                // Handle QR Code
+                if (update.qr) {
+                    if (!connectionState.isAuthenticated) {
+                        qr = update.qr;
+                        logger.info('QR Code baru diterima');
+                        updateQR("qr");
                     }
-                    qr = update.qr;
-                    logger.info('New QR Code received');
-                    updateQR("qr");
                 } else if (!qr && update.connection !== "open" && !connectionState.isAuthenticated) {
-                    logger.info('Waiting for QR Code...');
+                    logger.info('Menunggu QR Code...');
                     updateQR("loading");
-                } else if (update.connection === "open") {
-                    logger.success('QR Code scanned successfully');
-                    updateQR("qrscanned");
                 }
 
                 saveConnectionState();
             } catch (error) {
-                logger.error('Error in connection.update handler', error);
+                logger.error('Error in connection.update handler:', error);
                 if (!connectionTracker.isReconnecting) {
                     await handleReconnection();
                 }
@@ -1680,11 +1668,11 @@ server.on('error', (error) => {
     }
 });
 
-// Optimasi fungsi updateQR
+// Modifikasi fungsi updateQR
 const updateQR = (data) => {
-    if (!soket) return; // Prevent unnecessary operations if no socket connection
+    if (!soket) return;
 
-    // Tambahkan debounce untuk mencegah generate QR terlalu cepat
+    // Reset timeout jika ada
     if (updateQR.timeout) {
         clearTimeout(updateQR.timeout);
     }
@@ -1692,27 +1680,45 @@ const updateQR = (data) => {
     updateQR.timeout = setTimeout(() => {
         switch (data) {
             case "qr":
-                // Hanya generate QR jika belum terautentikasi
-                if (!qr || connectionState.isAuthenticated) return;
+                if (!qr) {
+                    soket.emit("qrstatus", "./assets/loader.gif");
+                    soket.emit("log", "Menunggu QR Code...");
+                    return;
+                }
 
-                // Tunggu sebentar sebelum generate QR
-                setTimeout(() => {
-                    qrcode.toDataURL(qr, {
-                        errorCorrectionLevel: 'L',
-                        margin: 1,
-                        scale: 4
-                    }, (err, url) => {
-                        if (err) {
-                            console.error('QR generation error:', err);
-                            soket.emit("log", "Error generating QR code. Please try again.");
-                            return;
+                // Generate QR dengan kualitas lebih tinggi
+                qrcode.toDataURL(qr, {
+                    errorCorrectionLevel: 'H', // Tingkatkan koreksi error
+                    margin: 2, // Tambah margin
+                    scale: 8, // Tingkatkan skala
+                    color: {
+                        dark: '#000000',
+                        light: '#ffffff'
+                    }
+                }, (err, url) => {
+                    if (err) {
+                        logger.error('QR generation error:', err);
+                        soket.emit("log", "Error generating QR code. Please refresh page.");
+                        return;
+                    }
+
+                    // Simpan QR terakhir
+                    lastQRCode = url;
+
+                    // Kirim QR ke client
+                    soket.emit("qr", url);
+                    soket.emit("log", "Silakan scan QR Code dengan WhatsApp Anda");
+
+                    // Set timeout untuk refresh QR jika belum di-scan
+                    setTimeout(() => {
+                        if (!connectionState.isAuthenticated) {
+                            soket.emit("log", "QR Code expired, refreshing...");
+                            updateQR("loading");
                         }
-                        lastQRCode = url;
-                        soket.emit("qr", url);
-                        soket.emit("log", "QR Code received, please scan!");
-                    });
-                }, 2000); // Delay 2 detik sebelum generate QR
+                    }, 60000); // Refresh setelah 60 detik
+                });
                 break;
+
             case "connected":
                 lastQRCode = null;
                 connectionState.reconnectAttempts = 0;
@@ -1720,20 +1726,23 @@ const updateQR = (data) => {
                 soket.emit("qrstatus", "./assets/check.svg");
                 soket.emit("log", "WhatsApp terhubung!");
                 break;
+
             case "qrscanned":
                 lastQRCode = null;
                 connectionState.isAuthenticated = true;
                 soket.emit("qrstatus", "./assets/check.svg");
-                soket.emit("log", "QR Code Telah discan!");
+                soket.emit("log", "QR Code berhasil di-scan!");
                 break;
+
             case "loading":
                 soket.emit("qrstatus", "./assets/loader.gif");
-                soket.emit("log", "Registering QR Code, please wait!");
+                soket.emit("log", "Memproses QR Code, mohon tunggu...");
                 break;
+
             default:
                 break;
         }
-    }, 1000); // Delay 1 detik sebelum memproses update QR
+    }, 1000);
 };
 
 // Tambahkan middleware untuk menangani error

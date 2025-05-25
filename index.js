@@ -300,32 +300,113 @@ const getRandomPingMessage = () => {
     return pingMessages[randomIndex];
 };
 
-// Fungsi untuk menyimpan state koneksi
-const saveConnectionState = () => {
+// Tambahkan fungsi untuk validasi dan pembersihan session
+const validateAndCleanSession = async () => {
     try {
-        const state = {
-            isAuthenticated: connectionState.isAuthenticated,
-            lastConnectionTime: connectionState.lastConnectionTime,
-            connectionStatus: connectionState.connectionStatus
-        };
-        fs.writeFileSync('connection_state.json', JSON.stringify(state));
+        logger.info('Validating and cleaning session...');
+
+        // Cek folder session
+        if (!fs.existsSync('baileys_auth_info')) {
+            fs.mkdirSync('baileys_auth_info', { recursive: true });
+            logger.info('Created session directory');
+            return false;
+        }
+
+        // Cek file session
+        const files = fs.readdirSync('baileys_auth_info');
+        if (files.length === 0) {
+            logger.info('No session files found');
+            return false;
+        }
+
+        // Validasi file session
+        const requiredFiles = ['creds.json', 'session-1.json'];
+        const missingFiles = requiredFiles.filter(file => !files.includes(file));
+
+        if (missingFiles.length > 0) {
+            logger.warn(`Missing required session files: ${missingFiles.join(', ')}`);
+            return false;
+        }
+
+        // Cek umur session
+        const credsPath = path.join('baileys_auth_info', 'creds.json');
+        if (fs.existsSync(credsPath)) {
+            const stats = fs.statSync(credsPath);
+            const sessionAge = Date.now() - stats.mtime.getTime();
+            const MAX_SESSION_AGE = 7 * 24 * 60 * 60 * 1000; // 7 hari
+
+            if (sessionAge > MAX_SESSION_AGE) {
+                logger.warn('Session is too old, cleaning up...');
+                await handleLogout();
+                return false;
+            }
+        }
+
+        return true;
     } catch (error) {
-        console.error('Error saving connection state:', error);
-        // Jangan throw error, biarkan aplikasi tetap berjalan
+        logger.error('Error validating session:', error);
+        return false;
     }
 };
 
-// Fungsi untuk memuat state koneksi
-const loadConnectionState = () => {
+// Optimasi fungsi loadConnectionState
+const loadConnectionState = async () => {
     try {
+        // Validasi session terlebih dahulu
+        const isValidSession = await validateAndCleanSession();
+        if (!isValidSession) {
+            logger.warn('Invalid session detected, resetting state');
+            connectionState = {
+                isConnecting: false,
+                lastConnectionAttempt: null,
+                reconnectAttempts: 0,
+                maxReconnectAttempts: 10,
+                isAuthenticated: false,
+                lastConnectionTime: null,
+                connectionStatus: 'disconnected',
+                messageQueue: [],
+                lastHeartbeat: null
+            };
+            return;
+        }
+
         if (fs.existsSync('connection_state.json')) {
             const state = JSON.parse(fs.readFileSync('connection_state.json'));
-            connectionState.isAuthenticated = state.isAuthenticated;
+
+            // Validasi state
+            if (state.lastConnectionTime) {
+                const connectionAge = Date.now() - state.lastConnectionTime;
+                const MAX_CONNECTION_AGE = 24 * 60 * 60 * 1000; // 24 jam
+
+                if (connectionAge > MAX_CONNECTION_AGE) {
+                    logger.warn('Connection state is too old, resetting...');
+                    connectionState = {
+                        isConnecting: false,
+                        lastConnectionAttempt: null,
+                        reconnectAttempts: 0,
+                        maxReconnectAttempts: 10,
+                        isAuthenticated: false,
+                        lastConnectionTime: null,
+                        connectionStatus: 'disconnected',
+                        messageQueue: [],
+                        lastHeartbeat: null
+                    };
+                    return;
+                }
+            }
+
+            // Update state dengan validasi
+            connectionState.isAuthenticated = state.isAuthenticated && isValidSession;
             connectionState.lastConnectionTime = state.lastConnectionTime;
             connectionState.connectionStatus = state.connectionStatus;
+
+            // Reset jika status tidak valid
+            if (!['connected', 'connecting', 'disconnected'].includes(connectionState.connectionStatus)) {
+                connectionState.connectionStatus = 'disconnected';
+            }
         }
     } catch (error) {
-        console.error('Error loading connection state:', error);
+        logger.error('Error loading connection state:', error);
         // Reset ke default state jika terjadi error
         connectionState = {
             isConnecting: false,
@@ -338,6 +419,29 @@ const loadConnectionState = () => {
             messageQueue: [],
             lastHeartbeat: null
         };
+    }
+};
+
+// Optimasi fungsi saveConnectionState
+const saveConnectionState = () => {
+    try {
+        const state = {
+            isAuthenticated: connectionState.isAuthenticated,
+            lastConnectionTime: connectionState.lastConnectionTime,
+            connectionStatus: connectionState.connectionStatus,
+            lastHeartbeat: connectionState.lastHeartbeat
+        };
+
+        // Validasi sebelum menyimpan
+        if (state.lastConnectionTime && Date.now() - state.lastConnectionTime > 24 * 60 * 60 * 1000) {
+            logger.warn('Connection state is too old, not saving');
+            return;
+        }
+
+        fs.writeFileSync('connection_state.json', JSON.stringify(state));
+        logger.info('Connection state saved successfully');
+    } catch (error) {
+        logger.error('Error saving connection state:', error);
     }
 };
 
@@ -610,10 +714,19 @@ app.get('/logs/latest', (req, res) => {
     });
 });
 
-// Optimasi konfigurasi koneksi WhatsApp
+// Modifikasi fungsi connectToWhatsApp
 async function connectToWhatsApp() {
     try {
         logger.info('Starting WhatsApp connection...');
+
+        // Validasi session sebelum koneksi
+        const isValidSession = await validateAndCleanSession();
+        if (!isValidSession) {
+            logger.warn('Invalid session detected, starting fresh connection');
+            connectionState.isAuthenticated = false;
+            connectionState.connectionStatus = 'disconnected';
+        }
+
         const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
         let { version, isLatest } = await fetchLatestBaileysVersion();
 

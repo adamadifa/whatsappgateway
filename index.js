@@ -132,8 +132,15 @@ app.use("/assets", express.static(__dirname + "/client/assets"));
 
 // Route untuk halaman scan QR
 app.get("/scan", (req, res) => {
+    console.log("Akses /scan masuk ke Express");
     res.type('html');
     res.sendFile(path.join(__dirname, "client", "server.html"));
+});
+
+// Endpoint test untuk memastikan Express bisa mengirim HTML
+app.get("/test-html", (req, res) => {
+    res.type('html');
+    res.send("<h1>Test HTML Berhasil</h1>");
 });
 
 // Route untuk halaman utama

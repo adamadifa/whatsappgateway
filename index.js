@@ -682,17 +682,17 @@ async function connectToWhatsApp() {
 
         logger.info(`Using Baileys version: ${version}, isLatest: ${isLatest}`);
 
-        // Tambahkan konfigurasi koneksi yang lebih robust
+        // Modifikasi konfigurasi socket WhatsApp
         sock = makeWASocket({
             auth: state,
             logger: log({ level: "silent" }),
             version,
             shouldIgnoreJid: jid => isJidBroadcast(jid),
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
-            retryRequestDelayMs: 250,
+            connectTimeoutMs: 120000, // Naikkan timeout koneksi ke 120 detik
+            defaultQueryTimeoutMs: 120000, // Naikkan timeout query ke 120 detik
+            retryRequestDelayMs: 1000, // Naikkan delay retry ke 1 detik
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 15000, // Kurangi interval keepalive
+            keepAliveIntervalMs: 30000, // Naikkan interval keepalive ke 30 detik
             emitOwnEvents: true,
             generateHighQualityLinkPreview: true,
             browser: ['Chrome (Linux)', '', ''],
@@ -718,6 +718,37 @@ async function connectToWhatsApp() {
                         unarchiveChats: false
                     }
                 }
+            },
+            // Tambahkan opsi untuk menangani timeout
+            timeoutMs: 120000, // Timeout umum 120 detik
+            retryRequestDelayMs: 1000, // Delay 1 detik antara retry
+            maxRetries: 5, // Maksimum 5 kali retry
+            connectTimeoutMs: 120000, // Timeout koneksi 120 detik
+            defaultQueryTimeoutMs: 120000, // Timeout query 120 detik
+            keepAliveIntervalMs: 30000, // Interval keepalive 30 detik
+            emitOwnEvents: true,
+            markOnlineOnConnect: true,
+            syncFullHistory: false, // Nonaktifkan sync full history
+            patchMessageBeforeSending: (message) => {
+                const requiresPatch = !!(
+                    message.buttonsMessage ||
+                    message.templateMessage ||
+                    message.listMessage
+                );
+                if (requiresPatch) {
+                    message = {
+                        viewOnceMessage: {
+                            message: {
+                                messageContextInfo: {
+                                    deviceListMetadataVersion: 2,
+                                    deviceListMetadata: {},
+                                },
+                                ...message,
+                            },
+                        },
+                    };
+                }
+                return message;
             }
         });
 
@@ -874,7 +905,7 @@ const isConnected = () => {
     return sock?.user ? true : false;
 };
 
-// Modifikasi fungsi handleReconnection
+// Modifikasi fungsi handleReconnection untuk menangani timeout
 const handleReconnection = async () => {
     if (connectionTracker.isReconnecting) {
         logger.info('Reconnection already in progress, skipping...');
@@ -898,11 +929,24 @@ const handleReconnection = async () => {
         // Cek apakah user sudah logout
         if (sock?.user?.id) {
             try {
-                // Tunggu lebih lama sebelum mencoba ping
-                await new Promise(resolve => setTimeout(resolve, 5000));
+                // Tambahkan timeout untuk ping
+                const pingPromise = new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Ping timeout'));
+                    }, 30000); // 30 detik timeout
 
-                const pingMessage = getRandomPingMessage();
-                await sock.sendMessage(sock.user.id, { text: pingMessage });
+                    sock.sendMessage(sock.user.id, { text: getRandomPingMessage() })
+                        .then(() => {
+                            clearTimeout(timeout);
+                            resolve();
+                        })
+                        .catch((error) => {
+                            clearTimeout(timeout);
+                            reject(error);
+                        });
+                });
+
+                await pingPromise;
                 logger.success('Koneksi WhatsApp masih aktif');
                 connectionState.connectionStatus = 'connected';
                 connectionState.isConnecting = false;
@@ -917,9 +961,9 @@ const handleReconnection = async () => {
         await connectToWhatsApp();
 
         // Tunggu lebih lama untuk memastikan koneksi terbentuk
-        await new Promise(resolve => setTimeout(resolve, 15000));
+        await new Promise(resolve => setTimeout(resolve, 30000));
 
-        // Coba beberapa kali untuk memverifikasi koneksi
+        // Coba beberapa kali untuk memverifikasi koneksi dengan timeout
         let attempts = 0;
         const maxAttempts = 5;
         let lastError = null;
@@ -933,11 +977,24 @@ const handleReconnection = async () => {
                     continue;
                 }
 
-                // Tunggu lebih lama sebelum verifikasi
-                await new Promise(resolve => setTimeout(resolve, 3000));
+                // Tambahkan timeout untuk verifikasi
+                const verifyPromise = new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Verification timeout'));
+                    }, 30000); // 30 detik timeout
 
-                const pingMessage = getRandomPingMessage();
-                await sock.sendMessage(sock.user.id, { text: pingMessage });
+                    sock.sendMessage(sock.user.id, { text: getRandomPingMessage() })
+                        .then(() => {
+                            clearTimeout(timeout);
+                            resolve();
+                        })
+                        .catch((error) => {
+                            clearTimeout(timeout);
+                            reject(error);
+                        });
+                });
+
+                await verifyPromise;
                 logger.success('Reconnect berhasil dan koneksi terverifikasi');
                 connectionState.connectionStatus = 'connected';
                 connectionState.reconnectAttempts = 0;
@@ -954,7 +1011,7 @@ const handleReconnection = async () => {
 
                 if (attempts < maxAttempts) {
                     // Tunggu lebih lama sebelum mencoba lagi
-                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    await new Promise(resolve => setTimeout(resolve, 10000));
                 }
             }
         }

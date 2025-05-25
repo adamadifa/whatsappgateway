@@ -912,18 +912,48 @@ app.post("/send-message", async (req, res) => {
 
         numberWA = '62' + number.substring(1) + "@s.whatsapp.net";
 
+        // Coba koneksi ulang jika tidak terhubung
         if (!isConnected()) {
-            // Simpan pesan ke queue jika tidak terhubung
-            connectionState.messageQueue.push({
-                to: numberWA,
-                content: { text: pesankirim }
-            });
-            return res.status(200).json({
-                status: true,
-                response: 'Pesan akan dikirim setelah koneksi tersedia'
-            });
+            logger.info('Koneksi terputus, mencoba koneksi ulang...');
+            const reconnectSuccess = await handleReconnection();
+
+            if (!reconnectSuccess) {
+                // Jika gagal reconnect, simpan ke queue
+                connectionState.messageQueue.push({
+                    to: numberWA,
+                    content: { text: pesankirim }
+                });
+                return res.status(200).json({
+                    status: true,
+                    response: 'Pesan akan dikirim setelah koneksi tersedia'
+                });
+            }
         }
 
+        // Verifikasi koneksi dengan ping
+        try {
+            if (sock?.user?.id) {
+                await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
+            } else {
+                throw new Error('User ID tidak tersedia');
+            }
+        } catch (error) {
+            logger.warn('Verifikasi koneksi gagal, mencoba koneksi ulang...', error);
+            const reconnectSuccess = await handleReconnection();
+
+            if (!reconnectSuccess) {
+                connectionState.messageQueue.push({
+                    to: numberWA,
+                    content: { text: pesankirim }
+                });
+                return res.status(200).json({
+                    status: true,
+                    response: 'Pesan akan dikirim setelah koneksi tersedia'
+                });
+            }
+        }
+
+        // Cek nomor WhatsApp
         const exists = await sock.onWhatsApp(numberWA);
         if (!exists?.jid && !(exists && exists[0]?.jid)) {
             return res.status(500).json({
@@ -941,12 +971,40 @@ app.post("/send-message", async (req, res) => {
                     response: result
                 });
             } catch (error) {
-                // Simpan pesan ke queue jika gagal
-                connectionState.messageQueue.push({
-                    to: exists.jid || exists[0].jid,
-                    content: { text: pesankirim }
-                });
-                throw error;
+                logger.error('Gagal mengirim pesan:', error);
+
+                // Coba koneksi ulang jika gagal kirim
+                const reconnectSuccess = await handleReconnection();
+                if (reconnectSuccess) {
+                    // Coba kirim ulang setelah reconnect berhasil
+                    try {
+                        const result = await sock.sendMessage(exists.jid || exists[0].jid, { text: pesankirim });
+                        return res.status(200).json({
+                            status: true,
+                            response: result
+                        });
+                    } catch (retryError) {
+                        logger.error('Gagal mengirim pesan setelah reconnect:', retryError);
+                        connectionState.messageQueue.push({
+                            to: exists.jid || exists[0].jid,
+                            content: { text: pesankirim }
+                        });
+                        return res.status(200).json({
+                            status: true,
+                            response: 'Pesan akan dikirim setelah koneksi tersedia'
+                        });
+                    }
+                } else {
+                    // Simpan ke queue jika reconnect gagal
+                    connectionState.messageQueue.push({
+                        to: exists.jid || exists[0].jid,
+                        content: { text: pesankirim }
+                    });
+                    return res.status(200).json({
+                        status: true,
+                        response: 'Pesan akan dikirim setelah koneksi tersedia'
+                    });
+                }
             }
         }
 
@@ -954,7 +1012,7 @@ app.post("/send-message", async (req, res) => {
         // ... existing file handling code ...
 
     } catch (err) {
-        console.error('Error sending message:', err);
+        logger.error('Error sending message:', err);
         return res.status(500).json({
             status: false,
             response: err.message || 'Error sending message'

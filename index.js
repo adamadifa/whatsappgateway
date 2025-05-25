@@ -132,9 +132,8 @@ app.use("/assets", express.static(__dirname + "/client/assets"));
 
 // Route untuk halaman scan QR
 app.get("/scan", (req, res) => {
-    res.sendFile("./client/server.html", {
-        root: __dirname,
-    });
+    res.type('html');
+    res.sendFile(path.join(__dirname, "client", "server.html"));
 });
 
 // Route untuk halaman utama

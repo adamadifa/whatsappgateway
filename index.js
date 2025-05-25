@@ -159,16 +159,15 @@ let sock;
 let qr;
 let soket;
 let lastQRCode = null;
-const connectionState = {
+let connectionState = {
     isConnecting: false,
     lastConnectionAttempt: null,
     reconnectAttempts: 0,
-    maxReconnectAttempts: 10,
+    maxReconnectAttempts: 5,
     isAuthenticated: false,
     lastConnectionTime: null,
-    connectionStatus: 'disconnected',
-    messageQueue: [],
-    lastHeartbeat: null
+    connectionStatus: 'disconnected', // 'disconnected', 'connecting', 'connected'
+    messageQueue: [] // Queue untuk menyimpan pesan yang gagal terkirim
 };
 
 // Tambahkan array template pesan untuk ping
@@ -331,17 +330,16 @@ const loadConnectionState = () => {
             isConnecting: false,
             lastConnectionAttempt: null,
             reconnectAttempts: 0,
-            maxReconnectAttempts: 10,
+            maxReconnectAttempts: 5,
             isAuthenticated: false,
             lastConnectionTime: null,
             connectionStatus: 'disconnected',
-            messageQueue: [],
-            lastHeartbeat: null
+            messageQueue: []
         };
     }
 };
 
-// Optimasi fungsi handleFailedMessages
+// Fungsi untuk handle pesan yang gagal terkirim
 const handleFailedMessages = async () => {
     try {
         if (!isConnected() || connectionState.messageQueue.length === 0) {
@@ -354,55 +352,38 @@ const handleFailedMessages = async () => {
 
         for (const message of failedMessages) {
             try {
-                // Tambahkan delay yang lebih lama antara setiap pesan
-                await new Promise(resolve => setTimeout(resolve, 2000));
-
-                // Validasi pesan sebelum dikirim
-                if (!message.to || !message.content) {
-                    logger.warn('Invalid message format, skipping:', message);
-                    continue;
-                }
-
-                // Coba kirim pesan dengan retry
-                let retryCount = 0;
-                const maxRetries = 3;
-
-                while (retryCount < maxRetries) {
-                    try {
-                        const result = await sock.sendMessage(message.to, message.content);
-                        logger.success(`Successfully sent queued message to: ${message.to}`);
-                        break;
-                    } catch (error) {
-                        retryCount++;
-                        if (retryCount === maxRetries) {
-                            throw error;
-                        }
-                        // Tunggu sebelum retry
-                        await new Promise(resolve => setTimeout(resolve, 3000));
-                    }
-                }
-
-                // Tunggu lebih lama sebelum mencoba pesan berikutnya
+                // Tambahkan delay antara setiap pesan
                 await new Promise(resolve => setTimeout(resolve, 1000));
+
+                // Coba kirim pesan
+                const result = await sock.sendMessage(message.to, message.content);
+                logger.success(`Successfully sent queued message to: ${message.to}`);
+
+                // Tunggu sebentar sebelum mencoba pesan berikutnya
+                await new Promise(resolve => setTimeout(resolve, 500));
             } catch (error) {
                 logger.error(`Failed to send queued message to ${message.to}:`, error);
 
-                // Jika gagal, tambahkan kembali ke queue dengan timestamp dan retry count
-                if ((message.retryCount || 0) < 3) {
-                    connectionState.messageQueue.push({
-                        ...message,
-                        retryCount: (message.retryCount || 0) + 1,
-                        lastAttempt: Date.now()
-                    });
-                } else {
+                // Jika gagal, tambahkan kembali ke queue dengan timestamp
+                connectionState.messageQueue.push({
+                    ...message,
+                    retryCount: (message.retryCount || 0) + 1,
+                    lastAttempt: Date.now()
+                });
+
+                // Jika sudah mencoba lebih dari 3 kali, hapus dari queue
+                if ((message.retryCount || 0) >= 3) {
                     logger.warn(`Message to ${message.to} removed from queue after 3 failed attempts`);
+                    continue;
                 }
             }
         }
 
+        // Simpan state setelah selesai memproses
         saveConnectionState();
     } catch (error) {
         logger.error('Error handling failed messages:', error);
+        // Jangan throw error, biarkan aplikasi tetap berjalan
     }
 };
 
@@ -610,177 +591,43 @@ app.get('/logs/latest', (req, res) => {
     });
 });
 
-// Tambahkan variabel untuk tracking koneksi
-const connectionTracker = {
-    lastConnectionTime: null,
-    connectionAttempts: 0,
-    maxConnectionAttempts: 5,
-    connectionTimeout: 30000, // 30 detik
-    reconnectDelay: 5000, // 5 detik
-    isReconnecting: false
-};
-
-// Tambahkan fungsi untuk validasi session
-const validateSession = async () => {
-    try {
-        if (!sock?.user?.id) {
-            logger.warn('Session tidak valid: user ID tidak tersedia');
-            return false;
-        }
-
-        // Cek apakah file session ada
-        if (!fs.existsSync('baileys_auth_info')) {
-            logger.warn('Session tidak valid: folder auth tidak ditemukan');
-            return false;
-        }
-
-        // Cek apakah connection state valid
-        if (!connectionState.isAuthenticated) {
-            logger.warn('Session tidak valid: belum terautentikasi');
-            return false;
-        }
-
-        // Coba kirim pesan test
-        try {
-            const pingMessage = getRandomPingMessage();
-            await sock.sendMessage(sock.user.id, { text: pingMessage });
-            logger.success('Session valid: pesan test berhasil dikirim');
-            return true;
-        } catch (error) {
-            logger.error('Session tidak valid: gagal mengirim pesan test', error);
-            return false;
-        }
-    } catch (error) {
-        logger.error('Error saat validasi session:', error);
-        return false;
-    }
-};
-
-// Modifikasi fungsi connectToWhatsApp
+// Fungsi untuk koneksi ke WhatsApp
 async function connectToWhatsApp() {
     try {
-        if (connectionTracker.isReconnecting) {
-            logger.info('Reconnection already in progress, skipping...');
-            return;
-        }
-
-        // Cek session yang ada sebelum membuat koneksi baru
-        if (fs.existsSync('baileys_auth_info') && connectionState.isAuthenticated) {
-            logger.info('Mencoba menggunakan session yang ada...');
-            const sessionValid = await validateSession();
-            if (sessionValid) {
-                logger.success('Session valid, menggunakan koneksi yang ada');
-                return;
-            } else {
-                logger.warn('Session tidak valid, akan membuat koneksi baru');
-            }
-        }
-
         logger.info('Starting WhatsApp connection...');
         const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
         let { version, isLatest } = await fetchLatestBaileysVersion();
 
         logger.info(`Using Baileys version: ${version}, isLatest: ${isLatest}`);
 
-        // Modifikasi konfigurasi socket WhatsApp
         sock = makeWASocket({
             auth: state,
             logger: log({ level: "silent" }),
             version,
             shouldIgnoreJid: jid => isJidBroadcast(jid),
-            connectTimeoutMs: 120000, // Naikkan timeout koneksi ke 120 detik
-            defaultQueryTimeoutMs: 120000, // Naikkan timeout query ke 120 detik
-            retryRequestDelayMs: 1000, // Naikkan delay retry ke 1 detik
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            retryRequestDelayMs: 250,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000, // Naikkan interval keepalive ke 30 detik
+            keepAliveIntervalMs: 30000,
             emitOwnEvents: true,
             generateHighQualityLinkPreview: true,
             browser: ['Chrome (Linux)', '', ''],
             getMessage: async () => {
                 return { conversation: "Hello" }
-            },
-            // Tambahkan opsi untuk meningkatkan stabilitas
-            printQRInTerminal: false,
-            auth: {
-                ...state,
-                creds: {
-                    ...state.creds,
-                    noiseKey: state.creds.noiseKey,
-                    signedIdentityKey: state.creds.signedIdentityKey,
-                    signedPreKey: state.creds.signedPreKey,
-                    registrationId: state.creds.registrationId,
-                    advSecretKey: state.creds.advSecretKey,
-                    processedHistoryMessages: [],
-                    nextPreKeyId: 1,
-                    firstUnuploadedPreKeyId: 1,
-                    accountSyncCounter: 0,
-                    accountSettings: {
-                        unarchiveChats: false
-                    }
-                }
-            },
-            // Tambahkan opsi untuk menangani timeout
-            timeoutMs: 120000, // Timeout umum 120 detik
-            retryRequestDelayMs: 1000, // Delay 1 detik antara retry
-            maxRetries: 5, // Maksimum 5 kali retry
-            connectTimeoutMs: 120000, // Timeout koneksi 120 detik
-            defaultQueryTimeoutMs: 120000, // Timeout query 120 detik
-            keepAliveIntervalMs: 30000, // Interval keepalive 30 detik
-            emitOwnEvents: true,
-            markOnlineOnConnect: true,
-            syncFullHistory: false, // Nonaktifkan sync full history
-            patchMessageBeforeSending: (message) => {
-                const requiresPatch = !!(
-                    message.buttonsMessage ||
-                    message.templateMessage ||
-                    message.listMessage
-                );
-                if (requiresPatch) {
-                    message = {
-                        viewOnceMessage: {
-                            message: {
-                                messageContextInfo: {
-                                    deviceListMetadataVersion: 2,
-                                    deviceListMetadata: {},
-                                },
-                                ...message,
-                            },
-                        },
-                    };
-                }
-                return message;
             }
         });
 
-        // Tambahkan interval untuk menjaga koneksi
-        const keepAliveInterval = setInterval(async () => {
-            try {
-                if (sock?.user?.id) {
-                    await sock.sendPresenceAvailable();
-                    connectionTracker.lastConnectionTime = Date.now();
-                }
-            } catch (error) {
-                logger.error('Error in keepAlive:', error);
-            }
-        }, 15000); // Kirim presence setiap 15 detik
+        sock.multi = true;
 
-        // Tambahkan interval untuk verifikasi koneksi
-        const verifyConnectionInterval = setInterval(async () => {
-            try {
-                if (sock?.user?.id) {
-                    const pingMessage = getRandomPingMessage();
-                    await sock.sendMessage(sock.user.id, { text: pingMessage });
-                    connectionTracker.lastConnectionTime = Date.now();
-                }
-            } catch (error) {
-                logger.error('Error in connection verification:', error);
-                if (!connectionTracker.isReconnecting) {
-                    await handleReconnection();
-                }
+        // Tambahkan error handler untuk socket
+        sock.ev.on('error', async (err) => {
+            logger.error('WhatsApp socket error:', err);
+            if (!connectionState.isConnecting) {
+                await handleReconnection();
             }
-        }, 30000); // Verifikasi koneksi setiap 30 detik
+        });
 
-        // Modifikasi event handler connection.update
         sock.ev.on('connection.update', async (update) => {
             try {
                 const { connection, lastDisconnect } = update;
@@ -791,81 +638,55 @@ async function connectToWhatsApp() {
                     connectionState.connectionStatus = 'disconnected';
                     logger.warn(`Connection closed with status code: ${statusCode}`);
 
-                    // Hapus interval saat koneksi terputus
-                    clearInterval(keepAliveInterval);
-                    clearInterval(verifyConnectionInterval);
-
                     if (statusCode === DisconnectReason.badSession) {
-                        logger.error(`Session tidak valid, silakan scan ulang QR Code`);
-                        await handleLogout();
+                        logger.error(`Bad Session File, Please Delete ${session} and Scan Again`);
+                        await resetSession();
                     } else if (statusCode === DisconnectReason.connectionClosed ||
                         statusCode === DisconnectReason.connectionLost ||
                         statusCode === DisconnectReason.timedOut) {
-                        logger.warn("Koneksi terputus, mencoba reconnect...");
+                        logger.warn("Connection lost, attempting to reconnect...");
                         await handleReconnection();
                     } else if (statusCode === DisconnectReason.connectionReplaced) {
-                        logger.warn("Koneksi digantikan, mencoba reconnect...");
-                        await handleReconnection();
+                        logger.warn("Connection Replaced, Another New Session Opened");
+                        await resetSession();
                     } else if (statusCode === DisconnectReason.loggedOut) {
-                        logger.error(`WhatsApp telah logout, silakan scan ulang QR Code`);
-                        await handleLogout();
+                        logger.error(`Device Logged Out, Please Delete ${session} and Scan Again.`);
+                        await resetSession();
                     } else if (statusCode === DisconnectReason.restartRequired) {
-                        logger.warn("Perlu restart, mencoba reconnect...");
+                        logger.warn("Restart Required, Restarting...");
                         await handleReconnection();
                     } else {
                         logger.warn(`Unknown DisconnectReason: ${statusCode}`);
                         await handleReconnection();
                     }
                 } else if (connection === 'open') {
-                    // Reset connection tracker
-                    connectionTracker.connectionAttempts = 0;
-                    connectionTracker.lastConnectionTime = Date.now();
-                    connectionTracker.isReconnecting = false;
+                    logger.success('Connection opened successfully');
+                    connectionState.reconnectAttempts = 0;
+                    connectionState.isAuthenticated = true;
+                    connectionState.connectionStatus = 'connected';
+                    connectionState.lastConnectionTime = Date.now();
 
-                    // Verifikasi koneksi
-                    try {
-                        if (sock?.user?.id) {
-                            const sessionValid = await validateSession();
-                            if (sessionValid) {
-                                logger.success('Koneksi berhasil dan session terverifikasi');
-                                connectionState.reconnectAttempts = 0;
-                                connectionState.isAuthenticated = true;
-                                connectionState.connectionStatus = 'connected';
-                                connectionState.lastConnectionTime = Date.now();
-                                updateQR("connected");
-
-                                // Coba kirim ulang pesan yang gagal
-                                await handleFailedMessages();
-                            } else {
-                                logger.warn('Koneksi berhasil tapi session tidak valid');
-                                await handleLogout();
-                            }
-                        } else {
-                            logger.warn('Koneksi berhasil tapi user ID tidak tersedia');
-                            await handleLogout();
-                        }
-                    } catch (error) {
-                        logger.error('Gagal verifikasi koneksi:', error);
-                        await handleLogout();
-                    }
+                    // Coba kirim ulang pesan yang gagal
+                    await handleFailedMessages();
                 }
 
-                // Handle QR Code
-                if (update.qr) {
-                    if (!connectionState.isAuthenticated) {
-                        qr = update.qr;
-                        logger.info('QR Code baru diterima');
-                        updateQR("qr");
-                    }
+                if (update.qr && !connectionState.isAuthenticated) {
+                    qr = update.qr;
+                    logger.info('New QR Code received');
+                    updateQR("qr");
                 } else if (!qr && update.connection !== "open" && !connectionState.isAuthenticated) {
-                    logger.info('Menunggu QR Code...');
+                    logger.info('Waiting for QR Code...');
                     updateQR("loading");
+                } else if (update.connection === "open") {
+                    logger.success('QR Code scanned successfully');
+                    updateQR("qrscanned");
                 }
 
                 saveConnectionState();
             } catch (error) {
-                logger.error('Error in connection.update handler:', error);
-                if (!connectionTracker.isReconnecting) {
+                logger.error('Error in connection.update handler', error);
+                // Coba reconnect jika terjadi error
+                if (!connectionState.isConnecting) {
                     await handleReconnection();
                 }
             }
@@ -881,10 +702,10 @@ async function connectToWhatsApp() {
 
         // Coba reconnect setelah delay
         setTimeout(async () => {
-            if (!connectionTracker.isReconnecting) {
+            if (!connectionState.isConnecting) {
                 await handleReconnection();
             }
-        }, connectionTracker.reconnectDelay);
+        }, 5000);
     }
 }
 
@@ -893,21 +714,19 @@ const isConnected = () => {
     return sock?.user ? true : false;
 };
 
-// Modifikasi fungsi handleReconnection untuk menangani timeout
+// Optimasi fungsi handleReconnection
 const handleReconnection = async () => {
-    if (connectionTracker.isReconnecting) {
+    if (connectionState.isConnecting) {
         logger.info('Reconnection already in progress, skipping...');
         return false;
     }
 
     const now = Date.now();
-    if (connectionTracker.lastConnectionTime && (now - connectionTracker.lastConnectionTime) < connectionTracker.reconnectDelay) {
+    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 5000) {
         logger.info('Too soon to attempt reconnection, skipping...');
         return false;
     }
 
-    connectionTracker.isReconnecting = true;
-    connectionTracker.connectionAttempts++;
     connectionState.isConnecting = true;
     connectionState.lastConnectionAttempt = now;
     connectionState.reconnectAttempts++;
@@ -917,28 +736,12 @@ const handleReconnection = async () => {
         // Cek apakah user sudah logout
         if (sock?.user?.id) {
             try {
-                // Tambahkan timeout untuk ping
-                const pingPromise = new Promise((resolve, reject) => {
-                    const timeout = setTimeout(() => {
-                        reject(new Error('Ping timeout'));
-                    }, 30000); // 30 detik timeout
-
-                    sock.sendMessage(sock.user.id, { text: getRandomPingMessage() })
-                        .then(() => {
-                            clearTimeout(timeout);
-                            resolve();
-                        })
-                        .catch((error) => {
-                            clearTimeout(timeout);
-                            reject(error);
-                        });
-                });
-
-                await pingPromise;
+                // Gunakan pesan random untuk ping
+                const pingMessage = getRandomPingMessage();
+                await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Koneksi WhatsApp masih aktif');
                 connectionState.connectionStatus = 'connected';
                 connectionState.isConnecting = false;
-                connectionTracker.isReconnecting = false;
                 return true;
             } catch (error) {
                 logger.warn('Koneksi WhatsApp terputus, mencoba reconnect...', error);
@@ -949,11 +752,11 @@ const handleReconnection = async () => {
         await connectToWhatsApp();
 
         // Tunggu lebih lama untuk memastikan koneksi terbentuk
-        await new Promise(resolve => setTimeout(resolve, 30000));
+        await new Promise(resolve => setTimeout(resolve, 10000));
 
-        // Coba beberapa kali untuk memverifikasi koneksi dengan timeout
+        // Coba beberapa kali untuk memverifikasi koneksi
         let attempts = 0;
-        const maxAttempts = 5;
+        const maxAttempts = 3;
         let lastError = null;
 
         while (attempts < maxAttempts) {
@@ -961,33 +764,20 @@ const handleReconnection = async () => {
                 if (!sock?.user?.id) {
                     logger.warn('User ID tidak tersedia, mencoba lagi...');
                     attempts++;
-                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    await new Promise(resolve => setTimeout(resolve, 3000));
                     continue;
                 }
 
-                // Tambahkan timeout untuk verifikasi
-                const verifyPromise = new Promise((resolve, reject) => {
-                    const timeout = setTimeout(() => {
-                        reject(new Error('Verification timeout'));
-                    }, 30000); // 30 detik timeout
+                // Tunggu sebentar sebelum mencoba mengirim pesan
+                await new Promise(resolve => setTimeout(resolve, 2000));
 
-                    sock.sendMessage(sock.user.id, { text: getRandomPingMessage() })
-                        .then(() => {
-                            clearTimeout(timeout);
-                            resolve();
-                        })
-                        .catch((error) => {
-                            clearTimeout(timeout);
-                            reject(error);
-                        });
-                });
-
-                await verifyPromise;
+                // Gunakan pesan random untuk verifikasi
+                const pingMessage = getRandomPingMessage();
+                await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Reconnect berhasil dan koneksi terverifikasi');
                 connectionState.connectionStatus = 'connected';
                 connectionState.reconnectAttempts = 0;
                 connectionState.isConnecting = false;
-                connectionTracker.isReconnecting = false;
 
                 // Coba kirim ulang pesan yang gagal
                 await handleFailedMessages();
@@ -998,8 +788,8 @@ const handleReconnection = async () => {
                 logger.warn(`Percobaan verifikasi koneksi ${attempts}/${maxAttempts} gagal:`, error);
 
                 if (attempts < maxAttempts) {
-                    // Tunggu lebih lama sebelum mencoba lagi
-                    await new Promise(resolve => setTimeout(resolve, 10000));
+                    // Tunggu sebentar sebelum mencoba lagi
+                    await new Promise(resolve => setTimeout(resolve, 3000));
                 }
             }
         }
@@ -1013,25 +803,14 @@ const handleReconnection = async () => {
         return false;
     } finally {
         connectionState.isConnecting = false;
-        connectionTracker.isReconnecting = false;
         saveConnectionState();
     }
 };
 
-// Modifikasi fungsi handleLogout
-const handleLogout = async () => {
+// Fungsi untuk mereset session
+const resetSession = async () => {
     try {
-        logger.info('Handling WhatsApp logout...');
-
-        // Reset semua state koneksi
-        connectionState.isAuthenticated = false;
-        connectionState.connectionStatus = 'disconnected';
-        connectionState.lastConnectionTime = null;
-        connectionState.reconnectAttempts = 0;
-        connectionState.messageQueue = [];
-        connectionState.lastHeartbeat = null;
-
-        // Hapus file session dengan lebih teliti
+        // Hapus isi folder baileys_auth_info tanpa menghapus folder utamanya
         if (fs.existsSync('baileys_auth_info')) {
             const files = fs.readdirSync('baileys_auth_info');
             for (const file of files) {
@@ -1043,16 +822,31 @@ const handleLogout = async () => {
                         fs.unlinkSync(filePath);
                     }
                 } catch (error) {
-                    logger.error(`Error deleting file ${file}:`, error);
+                    console.error(`Error deleting file ${file}:`, error);
                 }
             }
-            // Hapus folder utama juga
-            fs.rmSync('baileys_auth_info', { recursive: true, force: true });
+            console.log('Session contents deleted successfully');
         }
 
+        // Reset connection state
+        connectionState = {
+            isConnecting: false,
+            lastConnectionAttempt: null,
+            reconnectAttempts: 0,
+            maxReconnectAttempts: 5,
+            isAuthenticated: false,
+            lastConnectionTime: null,
+            connectionStatus: 'disconnected',
+            messageQueue: []
+        };
+
         // Hapus file connection state
-        if (fs.existsSync('connection_state.json')) {
-            fs.unlinkSync('connection_state.json');
+        try {
+            if (fs.existsSync('connection_state.json')) {
+                fs.unlinkSync('connection_state.json');
+            }
+        } catch (error) {
+            console.error('Error deleting connection state file:', error);
         }
 
         // Reset QR code
@@ -1060,23 +854,14 @@ const handleLogout = async () => {
         lastQRCode = null;
 
         // Update status ke client
-        if (soket) {
-            soket.emit("qrstatus", "./assets/loader.gif");
-            soket.emit("log", "WhatsApp telah logout. Silakan scan QR code baru.");
-        }
+        soket?.emit("qrstatus", "./assets/loader.gif");
+        soket?.emit("log", "Session telah direset. Silakan scan QR code baru.");
 
-        // Simpan state
-        saveConnectionState();
-
-        // Tunggu sebentar sebelum mencoba koneksi ulang
-        await new Promise(resolve => setTimeout(resolve, 2000));
-
-        // Coba koneksi ulang
+        // Reconnect dengan session baru
         await connectToWhatsApp();
-
-        logger.success('Logout handled successfully');
     } catch (error) {
-        logger.error('Error handling logout:', error);
+        console.error('Error resetting session:', error);
+        soket?.emit("log", "Gagal mereset session. Silakan refresh halaman.");
     }
 };
 
@@ -1434,9 +1219,9 @@ io.on("connection", async (socket) => {
 
         // Implementasi heartbeat yang lebih robust
         let missedHeartbeats = 0;
-        const MAX_MISSED_HEARTBEATS = 5;
-        const HEARTBEAT_INTERVAL = 30000; // Meningkatkan interval heartbeat ke 30 detik
-        const HEARTBEAT_TIMEOUT = 10000; // Meningkatkan timeout ke 10 detik
+        const MAX_MISSED_HEARTBEATS = 3;
+        const HEARTBEAT_INTERVAL = 15000; // 15 detik
+        const HEARTBEAT_TIMEOUT = 5000; // 5 detik timeout
 
         const heartbeat = setInterval(() => {
             try {
@@ -1668,11 +1453,11 @@ server.on('error', (error) => {
     }
 });
 
-// Modifikasi fungsi updateQR
+// Optimasi fungsi updateQR
 const updateQR = (data) => {
-    if (!soket) return;
+    if (!soket) return; // Prevent unnecessary operations if no socket connection
 
-    // Reset timeout jika ada
+    // Tambahkan debounce untuk mencegah generate QR terlalu cepat
     if (updateQR.timeout) {
         clearTimeout(updateQR.timeout);
     }
@@ -1680,45 +1465,27 @@ const updateQR = (data) => {
     updateQR.timeout = setTimeout(() => {
         switch (data) {
             case "qr":
-                if (!qr) {
-                    soket.emit("qrstatus", "./assets/loader.gif");
-                    soket.emit("log", "Menunggu QR Code...");
-                    return;
-                }
+                // Hanya generate QR jika belum terautentikasi
+                if (!qr || connectionState.isAuthenticated) return;
 
-                // Generate QR dengan kualitas lebih tinggi
-                qrcode.toDataURL(qr, {
-                    errorCorrectionLevel: 'H', // Tingkatkan koreksi error
-                    margin: 2, // Tambah margin
-                    scale: 8, // Tingkatkan skala
-                    color: {
-                        dark: '#000000',
-                        light: '#ffffff'
-                    }
-                }, (err, url) => {
-                    if (err) {
-                        logger.error('QR generation error:', err);
-                        soket.emit("log", "Error generating QR code. Please refresh page.");
-                        return;
-                    }
-
-                    // Simpan QR terakhir
-                    lastQRCode = url;
-
-                    // Kirim QR ke client
-                    soket.emit("qr", url);
-                    soket.emit("log", "Silakan scan QR Code dengan WhatsApp Anda");
-
-                    // Set timeout untuk refresh QR jika belum di-scan
-                    setTimeout(() => {
-                        if (!connectionState.isAuthenticated) {
-                            soket.emit("log", "QR Code expired, refreshing...");
-                            updateQR("loading");
+                // Tunggu sebentar sebelum generate QR
+                setTimeout(() => {
+                    qrcode.toDataURL(qr, {
+                        errorCorrectionLevel: 'L',
+                        margin: 1,
+                        scale: 4
+                    }, (err, url) => {
+                        if (err) {
+                            console.error('QR generation error:', err);
+                            soket.emit("log", "Error generating QR code. Please try again.");
+                            return;
                         }
-                    }, 60000); // Refresh setelah 60 detik
-                });
+                        lastQRCode = url;
+                        soket.emit("qr", url);
+                        soket.emit("log", "QR Code received, please scan!");
+                    });
+                }, 2000); // Delay 2 detik sebelum generate QR
                 break;
-
             case "connected":
                 lastQRCode = null;
                 connectionState.reconnectAttempts = 0;
@@ -1726,23 +1493,20 @@ const updateQR = (data) => {
                 soket.emit("qrstatus", "./assets/check.svg");
                 soket.emit("log", "WhatsApp terhubung!");
                 break;
-
             case "qrscanned":
                 lastQRCode = null;
                 connectionState.isAuthenticated = true;
                 soket.emit("qrstatus", "./assets/check.svg");
-                soket.emit("log", "QR Code berhasil di-scan!");
+                soket.emit("log", "QR Code Telah discan!");
                 break;
-
             case "loading":
                 soket.emit("qrstatus", "./assets/loader.gif");
-                soket.emit("log", "Memproses QR Code, mohon tunggu...");
+                soket.emit("log", "Registering QR Code, please wait!");
                 break;
-
             default:
                 break;
         }
-    }, 1000);
+    }, 1000); // Delay 1 detik sebelum memproses update QR
 };
 
 // Tambahkan middleware untuk menangani error

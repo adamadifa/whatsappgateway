@@ -610,15 +610,79 @@ app.get('/logs/latest', (req, res) => {
     });
 });
 
-// Fungsi untuk koneksi ke WhatsApp
+// Tambahkan variabel untuk tracking koneksi
+const connectionTracker = {
+    lastConnectionTime: null,
+    connectionAttempts: 0,
+    maxConnectionAttempts: 5,
+    connectionTimeout: 30000, // 30 detik
+    reconnectDelay: 5000, // 5 detik
+    isReconnecting: false
+};
+
+// Tambahkan fungsi untuk validasi session
+const validateSession = async () => {
+    try {
+        if (!sock?.user?.id) {
+            logger.warn('Session tidak valid: user ID tidak tersedia');
+            return false;
+        }
+
+        // Cek apakah file session ada
+        if (!fs.existsSync('baileys_auth_info')) {
+            logger.warn('Session tidak valid: folder auth tidak ditemukan');
+            return false;
+        }
+
+        // Cek apakah connection state valid
+        if (!connectionState.isAuthenticated) {
+            logger.warn('Session tidak valid: belum terautentikasi');
+            return false;
+        }
+
+        // Coba kirim pesan test
+        try {
+            const pingMessage = getRandomPingMessage();
+            await sock.sendMessage(sock.user.id, { text: pingMessage });
+            logger.success('Session valid: pesan test berhasil dikirim');
+            return true;
+        } catch (error) {
+            logger.error('Session tidak valid: gagal mengirim pesan test', error);
+            return false;
+        }
+    } catch (error) {
+        logger.error('Error saat validasi session:', error);
+        return false;
+    }
+};
+
+// Modifikasi fungsi connectToWhatsApp
 async function connectToWhatsApp() {
     try {
+        if (connectionTracker.isReconnecting) {
+            logger.info('Reconnection already in progress, skipping...');
+            return;
+        }
+
+        // Cek session yang ada sebelum membuat koneksi baru
+        if (fs.existsSync('baileys_auth_info') && connectionState.isAuthenticated) {
+            logger.info('Mencoba menggunakan session yang ada...');
+            const sessionValid = await validateSession();
+            if (sessionValid) {
+                logger.success('Session valid, menggunakan koneksi yang ada');
+                return;
+            } else {
+                logger.warn('Session tidak valid, akan membuat koneksi baru');
+            }
+        }
+
         logger.info('Starting WhatsApp connection...');
         const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
         let { version, isLatest } = await fetchLatestBaileysVersion();
 
         logger.info(`Using Baileys version: ${version}, isLatest: ${isLatest}`);
 
+        // Tambahkan konfigurasi koneksi yang lebih robust
         sock = makeWASocket({
             auth: state,
             logger: log({ level: "silent" }),
@@ -628,25 +692,64 @@ async function connectToWhatsApp() {
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 250,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
+            keepAliveIntervalMs: 15000, // Kurangi interval keepalive
             emitOwnEvents: true,
             generateHighQualityLinkPreview: true,
             browser: ['Chrome (Linux)', '', ''],
             getMessage: async () => {
                 return { conversation: "Hello" }
+            },
+            // Tambahkan opsi untuk meningkatkan stabilitas
+            printQRInTerminal: false,
+            auth: {
+                ...state,
+                creds: {
+                    ...state.creds,
+                    noiseKey: state.creds.noiseKey,
+                    signedIdentityKey: state.creds.signedIdentityKey,
+                    signedPreKey: state.creds.signedPreKey,
+                    registrationId: state.creds.registrationId,
+                    advSecretKey: state.creds.advSecretKey,
+                    processedHistoryMessages: [],
+                    nextPreKeyId: 1,
+                    firstUnuploadedPreKeyId: 1,
+                    accountSyncCounter: 0,
+                    accountSettings: {
+                        unarchiveChats: false
+                    }
+                }
             }
         });
 
-        sock.multi = true;
-
-        // Tambahkan error handler untuk socket
-        sock.ev.on('error', async (err) => {
-            logger.error('WhatsApp socket error:', err);
-            if (!connectionState.isConnecting) {
-                await handleReconnection();
+        // Tambahkan interval untuk menjaga koneksi
+        const keepAliveInterval = setInterval(async () => {
+            try {
+                if (sock?.user?.id) {
+                    await sock.sendPresenceAvailable();
+                    connectionTracker.lastConnectionTime = Date.now();
+                }
+            } catch (error) {
+                logger.error('Error in keepAlive:', error);
             }
-        });
+        }, 15000); // Kirim presence setiap 15 detik
 
+        // Tambahkan interval untuk verifikasi koneksi
+        const verifyConnectionInterval = setInterval(async () => {
+            try {
+                if (sock?.user?.id) {
+                    const pingMessage = getRandomPingMessage();
+                    await sock.sendMessage(sock.user.id, { text: pingMessage });
+                    connectionTracker.lastConnectionTime = Date.now();
+                }
+            } catch (error) {
+                logger.error('Error in connection verification:', error);
+                if (!connectionTracker.isReconnecting) {
+                    await handleReconnection();
+                }
+            }
+        }, 30000); // Verifikasi koneksi setiap 30 detik
+
+        // Modifikasi event handler connection.update
         sock.ev.on('connection.update', async (update) => {
             try {
                 const { connection, lastDisconnect } = update;
@@ -657,6 +760,10 @@ async function connectToWhatsApp() {
                     connectionState.connectionStatus = 'disconnected';
                     logger.warn(`Connection closed with status code: ${statusCode}`);
 
+                    // Hapus interval saat koneksi terputus
+                    clearInterval(keepAliveInterval);
+                    clearInterval(verifyConnectionInterval);
+
                     if (statusCode === DisconnectReason.badSession) {
                         logger.error(`Bad Session File, Please Delete ${session} and Scan Again`);
                         await handleLogout();
@@ -666,8 +773,15 @@ async function connectToWhatsApp() {
                         logger.warn("Connection lost, attempting to reconnect...");
                         await handleReconnection();
                     } else if (statusCode === DisconnectReason.connectionReplaced) {
-                        logger.warn("Connection Replaced, Another New Session Opened");
-                        await handleLogout();
+                        // Cek session sebelum reconnect
+                        const sessionValid = await validateSession();
+                        if (sessionValid) {
+                            logger.info('Session masih valid, mencoba reconnect...');
+                            await handleReconnection();
+                        } else {
+                            logger.warn('Session tidak valid, melakukan logout...');
+                            await handleLogout();
+                        }
                     } else if (statusCode === DisconnectReason.loggedOut) {
                         logger.error(`Device Logged Out, Please Delete ${session} and Scan Again.`);
                         await handleLogout();
@@ -679,31 +793,45 @@ async function connectToWhatsApp() {
                         await handleReconnection();
                     }
                 } else if (connection === 'open') {
-                    // Verifikasi koneksi sebelum menganggap terhubung
+                    // Reset connection tracker saat koneksi berhasil
+                    connectionTracker.connectionAttempts = 0;
+                    connectionTracker.lastConnectionTime = Date.now();
+                    connectionTracker.isReconnecting = false;
+
+                    // Verifikasi koneksi dan session
                     try {
                         if (sock?.user?.id) {
-                            const pingMessage = getRandomPingMessage();
-                            await sock.sendMessage(sock.user.id, { text: pingMessage });
+                            const sessionValid = await validateSession();
+                            if (sessionValid) {
+                                logger.success('Connection opened and session verified successfully');
+                                connectionState.reconnectAttempts = 0;
+                                connectionState.isAuthenticated = true;
+                                connectionState.connectionStatus = 'connected';
+                                connectionState.lastConnectionTime = Date.now();
 
-                            logger.success('Connection opened and verified successfully');
-                            connectionState.reconnectAttempts = 0;
-                            connectionState.isAuthenticated = true;
-                            connectionState.connectionStatus = 'connected';
-                            connectionState.lastConnectionTime = Date.now();
-
-                            // Coba kirim ulang pesan yang gagal
-                            await handleFailedMessages();
+                                // Coba kirim ulang pesan yang gagal
+                                await handleFailedMessages();
+                            } else {
+                                logger.warn('Connection opened but session invalid');
+                                await handleLogout();
+                            }
                         } else {
                             logger.warn('Connection opened but user ID not available');
                             await handleLogout();
                         }
                     } catch (error) {
-                        logger.error('Failed to verify connection:', error);
+                        logger.error('Failed to verify connection and session:', error);
                         await handleLogout();
                     }
                 }
 
                 if (update.qr && !connectionState.isAuthenticated) {
+                    // Cek session sebelum menampilkan QR
+                    const sessionValid = await validateSession();
+                    if (sessionValid) {
+                        logger.info('Session valid, tidak perlu menampilkan QR');
+                        return;
+                    }
                     qr = update.qr;
                     logger.info('New QR Code received');
                     updateQR("qr");
@@ -718,7 +846,7 @@ async function connectToWhatsApp() {
                 saveConnectionState();
             } catch (error) {
                 logger.error('Error in connection.update handler', error);
-                if (!connectionState.isConnecting) {
+                if (!connectionTracker.isReconnecting) {
                     await handleReconnection();
                 }
             }
@@ -734,10 +862,10 @@ async function connectToWhatsApp() {
 
         // Coba reconnect setelah delay
         setTimeout(async () => {
-            if (!connectionState.isConnecting) {
+            if (!connectionTracker.isReconnecting) {
                 await handleReconnection();
             }
-        }, 5000);
+        }, connectionTracker.reconnectDelay);
     }
 }
 
@@ -746,14 +874,21 @@ const isConnected = () => {
     return sock?.user ? true : false;
 };
 
-// Optimasi fungsi handleReconnection
+// Modifikasi fungsi handleReconnection
 const handleReconnection = async () => {
+    if (connectionTracker.isReconnecting) {
+        logger.info('Reconnection already in progress, skipping...');
+        return false;
+    }
+
     const now = Date.now();
-    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 10000) {
+    if (connectionTracker.lastConnectionTime && (now - connectionTracker.lastConnectionTime) < connectionTracker.reconnectDelay) {
         logger.info('Too soon to attempt reconnection, skipping...');
         return false;
     }
 
+    connectionTracker.isReconnecting = true;
+    connectionTracker.connectionAttempts++;
     connectionState.isConnecting = true;
     connectionState.lastConnectionAttempt = now;
     connectionState.reconnectAttempts++;
@@ -771,6 +906,7 @@ const handleReconnection = async () => {
                 logger.success('Koneksi WhatsApp masih aktif');
                 connectionState.connectionStatus = 'connected';
                 connectionState.isConnecting = false;
+                connectionTracker.isReconnecting = false;
                 return true;
             } catch (error) {
                 logger.warn('Koneksi WhatsApp terputus, mencoba reconnect...', error);
@@ -785,7 +921,7 @@ const handleReconnection = async () => {
 
         // Coba beberapa kali untuk memverifikasi koneksi
         let attempts = 0;
-        const maxAttempts = 5; // Meningkatkan jumlah percobaan
+        const maxAttempts = 5;
         let lastError = null;
 
         while (attempts < maxAttempts) {
@@ -806,6 +942,7 @@ const handleReconnection = async () => {
                 connectionState.connectionStatus = 'connected';
                 connectionState.reconnectAttempts = 0;
                 connectionState.isConnecting = false;
+                connectionTracker.isReconnecting = false;
 
                 // Coba kirim ulang pesan yang gagal
                 await handleFailedMessages();
@@ -831,11 +968,12 @@ const handleReconnection = async () => {
         return false;
     } finally {
         connectionState.isConnecting = false;
+        connectionTracker.isReconnecting = false;
         saveConnectionState();
     }
 };
 
-// Fungsi untuk menangani logout
+// Modifikasi fungsi handleLogout
 const handleLogout = async () => {
     try {
         logger.info('Handling WhatsApp logout...');
@@ -848,7 +986,7 @@ const handleLogout = async () => {
         connectionState.messageQueue = [];
         connectionState.lastHeartbeat = null;
 
-        // Hapus file session
+        // Hapus file session dengan lebih teliti
         if (fs.existsSync('baileys_auth_info')) {
             const files = fs.readdirSync('baileys_auth_info');
             for (const file of files) {
@@ -863,6 +1001,8 @@ const handleLogout = async () => {
                     logger.error(`Error deleting file ${file}:`, error);
                 }
             }
+            // Hapus folder utama juga
+            fs.rmSync('baileys_auth_info', { recursive: true, force: true });
         }
 
         // Hapus file connection state

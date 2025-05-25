@@ -354,23 +354,23 @@ const handleFailedMessages = async () => {
             try {
                 // Tambahkan delay antara setiap pesan
                 await new Promise(resolve => setTimeout(resolve, 1000));
-                
+
                 // Coba kirim pesan
                 const result = await sock.sendMessage(message.to, message.content);
                 logger.success(`Successfully sent queued message to: ${message.to}`);
-                
+
                 // Tunggu sebentar sebelum mencoba pesan berikutnya
                 await new Promise(resolve => setTimeout(resolve, 500));
             } catch (error) {
                 logger.error(`Failed to send queued message to ${message.to}:`, error);
-                
+
                 // Jika gagal, tambahkan kembali ke queue dengan timestamp
                 connectionState.messageQueue.push({
                     ...message,
                     retryCount: (message.retryCount || 0) + 1,
                     lastAttempt: Date.now()
                 });
-                
+
                 // Jika sudah mencoba lebih dari 3 kali, hapus dari queue
                 if ((message.retryCount || 0) >= 3) {
                     logger.warn(`Message to ${message.to} removed from queue after 3 failed attempts`);
@@ -402,13 +402,13 @@ const cleanupOldLogs = () => {
     try {
         const now = Date.now();
         const files = fs.readdirSync(logDir);
-        
+
         files.forEach(file => {
             const filePath = path.join(logDir, file);
             const stats = fs.statSync(filePath);
             const fileAge = now - stats.mtime.getTime();
             const maxAge = LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
-            
+
             if (fileAge > maxAge) {
                 fs.unlinkSync(filePath);
                 logger.info(`Deleted old log file: ${file}`);
@@ -605,16 +605,24 @@ async function connectToWhatsApp() {
             logger: log({ level: "silent" }),
             version,
             shouldIgnoreJid: jid => isJidBroadcast(jid),
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
-            retryRequestDelayMs: 250,
+            connectTimeoutMs: 120000,
+            defaultQueryTimeoutMs: 120000,
+            retryRequestDelayMs: 500,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 30000,
+            keepAliveIntervalMs: 15000,
             emitOwnEvents: true,
             generateHighQualityLinkPreview: true,
             browser: ['Chrome (Linux)', '', ''],
             getMessage: async () => {
                 return { conversation: "Hello" }
+            },
+            printQRInTerminal: true,
+            auth: {
+                ...state,
+                creds: {
+                    ...state.creds,
+                    saveCreds: true
+                }
             }
         });
 
@@ -699,7 +707,7 @@ async function connectToWhatsApp() {
         logger.error('Error in connectToWhatsApp', error);
         connectionState.connectionStatus = 'disconnected';
         saveConnectionState();
-        
+
         // Coba reconnect setelah delay
         setTimeout(async () => {
             if (!connectionState.isConnecting) {
@@ -722,7 +730,7 @@ const handleReconnection = async () => {
     }
 
     const now = Date.now();
-    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 5000) {
+    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 10000) {
         logger.info('Too soon to attempt reconnection, skipping...');
         return false;
     }
@@ -736,6 +744,9 @@ const handleReconnection = async () => {
         // Cek apakah user sudah logout
         if (sock?.user?.id) {
             try {
+                // Tunggu lebih lama sebelum mencoba ping
+                await new Promise(resolve => setTimeout(resolve, 5000));
+
                 // Gunakan pesan random untuk ping
                 const pingMessage = getRandomPingMessage();
                 await sock.sendMessage(sock.user.id, { text: pingMessage });
@@ -752,11 +763,11 @@ const handleReconnection = async () => {
         await connectToWhatsApp();
 
         // Tunggu lebih lama untuk memastikan koneksi terbentuk
-        await new Promise(resolve => setTimeout(resolve, 10000));
+        await new Promise(resolve => setTimeout(resolve, 15000));
 
         // Coba beberapa kali untuk memverifikasi koneksi
         let attempts = 0;
-        const maxAttempts = 3;
+        const maxAttempts = 5; // Increase max attempts
         let lastError = null;
 
         while (attempts < maxAttempts) {
@@ -764,12 +775,12 @@ const handleReconnection = async () => {
                 if (!sock?.user?.id) {
                     logger.warn('User ID tidak tersedia, mencoba lagi...');
                     attempts++;
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    await new Promise(resolve => setTimeout(resolve, 5000)); // Increase delay
                     continue;
                 }
 
-                // Tunggu sebentar sebelum mencoba mengirim pesan
-                await new Promise(resolve => setTimeout(resolve, 2000));
+                // Tunggu lebih lama sebelum mencoba mengirim pesan
+                await new Promise(resolve => setTimeout(resolve, 5000));
 
                 // Gunakan pesan random untuk verifikasi
                 const pingMessage = getRandomPingMessage();
@@ -788,8 +799,8 @@ const handleReconnection = async () => {
                 logger.warn(`Percobaan verifikasi koneksi ${attempts}/${maxAttempts} gagal:`, error);
 
                 if (attempts < maxAttempts) {
-                    // Tunggu sebentar sebelum mencoba lagi
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    // Tunggu lebih lama sebelum mencoba lagi
+                    await new Promise(resolve => setTimeout(resolve, 5000));
                 }
             }
         }
@@ -881,7 +892,7 @@ app.post("/send-message", async (req, res) => {
         }
 
         numberWA = '62' + number.substring(1) + "@s.whatsapp.net";
-        
+
         if (!isConnected()) {
             // Simpan pesan ke queue jika tidak terhubung
             connectionState.messageQueue.push({
@@ -919,10 +930,10 @@ app.post("/send-message", async (req, res) => {
                 throw error;
             }
         }
-        
+
         // Handle pengiriman file
         // ... existing file handling code ...
-        
+
     } catch (err) {
         console.error('Error sending message:', err);
         return res.status(500).json({
@@ -1228,12 +1239,12 @@ io.on("connection", async (socket) => {
                 if (socket.connected) {
                     socket.emit('ping');
                     logger.info(`Heartbeat sent to client: ${socket.id}`);
-                    
+
                     // Set timeout untuk menunggu pong
                     const timeout = setTimeout(() => {
                         missedHeartbeats++;
                         logger.warn(`Missed heartbeat ${missedHeartbeats}/${MAX_MISSED_HEARTBEATS} for client: ${socket.id}`);
-                        
+
                         if (missedHeartbeats >= MAX_MISSED_HEARTBEATS) {
                             logger.error(`Client ${socket.id} missed too many heartbeats, forcing reconnect`);
                             clearInterval(heartbeat);
@@ -1361,7 +1372,7 @@ io.engine.on("connection_error", (err) => {
 // Tambahkan event handler untuk reconnection
 io.on('reconnect_attempt', () => {
     logger.info('Attempting to reconnect...');
-    
+
     // Implementasi exponential backoff untuk reconnect
     const backoff = {
         min: 1000,
@@ -1377,17 +1388,17 @@ io.on('reconnect_attempt', () => {
             backoff.max,
             backoff.min * Math.pow(backoff.factor, backoff.attempts)
         );
-        
+
         // Tambahkan jitter untuk menghindari reconnect bersamaan
         const jitter = delay * backoff.jitter * (Math.random() * 2 - 1);
         const finalDelay = delay + jitter;
 
         logger.info(`Reconnect attempt ${backoff.attempts} scheduled in ${Math.round(finalDelay)}ms`);
-        
+
         setTimeout(() => {
             try {
                 io.emit('reconnect_attempt');
-                
+
                 // Reset backoff jika berhasil
                 if (io.engine.clientsCount > 0) {
                     backoff.attempts = 0;
@@ -1560,7 +1571,7 @@ process.on('unhandledRejection', (error) => {
 // Handle process termination dengan lebih baik
 const gracefulShutdown = async () => {
     logger.info('Shutting down gracefully...');
-    
+
     try {
         // Tutup server
         server.close(() => {

@@ -659,7 +659,7 @@ async function connectToWhatsApp() {
 
                     if (statusCode === DisconnectReason.badSession) {
                         logger.error(`Bad Session File, Please Delete ${session} and Scan Again`);
-                        await resetSession();
+                        await handleLogout();
                     } else if (statusCode === DisconnectReason.connectionClosed ||
                         statusCode === DisconnectReason.connectionLost ||
                         statusCode === DisconnectReason.timedOut) {
@@ -667,10 +667,10 @@ async function connectToWhatsApp() {
                         await handleReconnection();
                     } else if (statusCode === DisconnectReason.connectionReplaced) {
                         logger.warn("Connection Replaced, Another New Session Opened");
-                        await resetSession();
+                        await handleLogout();
                     } else if (statusCode === DisconnectReason.loggedOut) {
                         logger.error(`Device Logged Out, Please Delete ${session} and Scan Again.`);
-                        await resetSession();
+                        await handleLogout();
                     } else if (statusCode === DisconnectReason.restartRequired) {
                         logger.warn("Restart Required, Restarting...");
                         await handleReconnection();
@@ -679,14 +679,28 @@ async function connectToWhatsApp() {
                         await handleReconnection();
                     }
                 } else if (connection === 'open') {
-                    logger.success('Connection opened successfully');
-                    connectionState.reconnectAttempts = 0;
-                    connectionState.isAuthenticated = true;
-                    connectionState.connectionStatus = 'connected';
-                    connectionState.lastConnectionTime = Date.now();
+                    // Verifikasi koneksi sebelum menganggap terhubung
+                    try {
+                        if (sock?.user?.id) {
+                            const pingMessage = getRandomPingMessage();
+                            await sock.sendMessage(sock.user.id, { text: pingMessage });
 
-                    // Coba kirim ulang pesan yang gagal
-                    await handleFailedMessages();
+                            logger.success('Connection opened and verified successfully');
+                            connectionState.reconnectAttempts = 0;
+                            connectionState.isAuthenticated = true;
+                            connectionState.connectionStatus = 'connected';
+                            connectionState.lastConnectionTime = Date.now();
+
+                            // Coba kirim ulang pesan yang gagal
+                            await handleFailedMessages();
+                        } else {
+                            logger.warn('Connection opened but user ID not available');
+                            await handleLogout();
+                        }
+                    } catch (error) {
+                        logger.error('Failed to verify connection:', error);
+                        await handleLogout();
+                    }
                 }
 
                 if (update.qr && !connectionState.isAuthenticated) {
@@ -704,7 +718,6 @@ async function connectToWhatsApp() {
                 saveConnectionState();
             } catch (error) {
                 logger.error('Error in connection.update handler', error);
-                // Coba reconnect jika terjadi error
                 if (!connectionState.isConnecting) {
                     await handleReconnection();
                 }
@@ -822,10 +835,20 @@ const handleReconnection = async () => {
     }
 };
 
-// Fungsi untuk mereset session
-const resetSession = async () => {
+// Fungsi untuk menangani logout
+const handleLogout = async () => {
     try {
-        // Hapus isi folder baileys_auth_info tanpa menghapus folder utamanya
+        logger.info('Handling WhatsApp logout...');
+
+        // Reset semua state koneksi
+        connectionState.isAuthenticated = false;
+        connectionState.connectionStatus = 'disconnected';
+        connectionState.lastConnectionTime = null;
+        connectionState.reconnectAttempts = 0;
+        connectionState.messageQueue = [];
+        connectionState.lastHeartbeat = null;
+
+        // Hapus file session
         if (fs.existsSync('baileys_auth_info')) {
             const files = fs.readdirSync('baileys_auth_info');
             for (const file of files) {
@@ -837,32 +860,14 @@ const resetSession = async () => {
                         fs.unlinkSync(filePath);
                     }
                 } catch (error) {
-                    console.error(`Error deleting file ${file}:`, error);
+                    logger.error(`Error deleting file ${file}:`, error);
                 }
             }
-            console.log('Session contents deleted successfully');
         }
 
-        // Reset connection state
-        connectionState = {
-            isConnecting: false,
-            lastConnectionAttempt: null,
-            reconnectAttempts: 0,
-            maxReconnectAttempts: 10,
-            isAuthenticated: false,
-            lastConnectionTime: null,
-            connectionStatus: 'disconnected',
-            messageQueue: [],
-            lastHeartbeat: null
-        };
-
         // Hapus file connection state
-        try {
-            if (fs.existsSync('connection_state.json')) {
-                fs.unlinkSync('connection_state.json');
-            }
-        } catch (error) {
-            console.error('Error deleting connection state file:', error);
+        if (fs.existsSync('connection_state.json')) {
+            fs.unlinkSync('connection_state.json');
         }
 
         // Reset QR code
@@ -870,14 +875,23 @@ const resetSession = async () => {
         lastQRCode = null;
 
         // Update status ke client
-        soket?.emit("qrstatus", "./assets/loader.gif");
-        soket?.emit("log", "Session telah direset. Silakan scan QR code baru.");
+        if (soket) {
+            soket.emit("qrstatus", "./assets/loader.gif");
+            soket.emit("log", "WhatsApp telah logout. Silakan scan QR code baru.");
+        }
 
-        // Reconnect dengan session baru
+        // Simpan state
+        saveConnectionState();
+
+        // Tunggu sebentar sebelum mencoba koneksi ulang
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Coba koneksi ulang
         await connectToWhatsApp();
+
+        logger.success('Logout handled successfully');
     } catch (error) {
-        console.error('Error resetting session:', error);
-        soket?.emit("log", "Gagal mereset session. Silakan refresh halaman.");
+        logger.error('Error handling logout:', error);
     }
 };
 

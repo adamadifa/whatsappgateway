@@ -132,15 +132,9 @@ app.use("/assets", express.static(__dirname + "/client/assets"));
 
 // Route untuk halaman scan QR
 app.get("/scan", (req, res) => {
-    console.log("Akses /scan masuk ke Express");
-    res.type('html');
-    res.sendFile(path.join(__dirname, "client", "server.html"));
-});
-
-// Endpoint test untuk memastikan Express bisa mengirim HTML
-app.get("/test-html", (req, res) => {
-    res.type('html');
-    res.send("<h1>Test HTML Berhasil</h1>");
+    res.sendFile("./client/server.html", {
+        root: __dirname,
+    });
 });
 
 // Route untuk halaman utama
@@ -165,15 +159,16 @@ let sock;
 let qr;
 let soket;
 let lastQRCode = null;
-let connectionState = {
+const connectionState = {
     isConnecting: false,
     lastConnectionAttempt: null,
     reconnectAttempts: 0,
-    maxReconnectAttempts: 5,
+    maxReconnectAttempts: 10,
     isAuthenticated: false,
     lastConnectionTime: null,
-    connectionStatus: 'disconnected', // 'disconnected', 'connecting', 'connected'
-    messageQueue: [] // Queue untuk menyimpan pesan yang gagal terkirim
+    connectionStatus: 'disconnected',
+    messageQueue: [],
+    lastHeartbeat: null
 };
 
 // Tambahkan array template pesan untuk ping
@@ -336,16 +331,17 @@ const loadConnectionState = () => {
             isConnecting: false,
             lastConnectionAttempt: null,
             reconnectAttempts: 0,
-            maxReconnectAttempts: 5,
+            maxReconnectAttempts: 10,
             isAuthenticated: false,
             lastConnectionTime: null,
             connectionStatus: 'disconnected',
-            messageQueue: []
+            messageQueue: [],
+            lastHeartbeat: null
         };
     }
 };
 
-// Fungsi untuk handle pesan yang gagal terkirim
+// Optimasi fungsi handleFailedMessages
 const handleFailedMessages = async () => {
     try {
         if (!isConnected() || connectionState.messageQueue.length === 0) {
@@ -358,38 +354,55 @@ const handleFailedMessages = async () => {
 
         for (const message of failedMessages) {
             try {
-                // Tambahkan delay antara setiap pesan
+                // Tambahkan delay yang lebih lama antara setiap pesan
+                await new Promise(resolve => setTimeout(resolve, 2000));
+
+                // Validasi pesan sebelum dikirim
+                if (!message.to || !message.content) {
+                    logger.warn('Invalid message format, skipping:', message);
+                    continue;
+                }
+
+                // Coba kirim pesan dengan retry
+                let retryCount = 0;
+                const maxRetries = 3;
+
+                while (retryCount < maxRetries) {
+                    try {
+                        const result = await sock.sendMessage(message.to, message.content);
+                        logger.success(`Successfully sent queued message to: ${message.to}`);
+                        break;
+                    } catch (error) {
+                        retryCount++;
+                        if (retryCount === maxRetries) {
+                            throw error;
+                        }
+                        // Tunggu sebelum retry
+                        await new Promise(resolve => setTimeout(resolve, 3000));
+                    }
+                }
+
+                // Tunggu lebih lama sebelum mencoba pesan berikutnya
                 await new Promise(resolve => setTimeout(resolve, 1000));
-
-                // Coba kirim pesan
-                const result = await sock.sendMessage(message.to, message.content);
-                logger.success(`Successfully sent queued message to: ${message.to}`);
-
-                // Tunggu sebentar sebelum mencoba pesan berikutnya
-                await new Promise(resolve => setTimeout(resolve, 500));
             } catch (error) {
                 logger.error(`Failed to send queued message to ${message.to}:`, error);
 
-                // Jika gagal, tambahkan kembali ke queue dengan timestamp
-                connectionState.messageQueue.push({
-                    ...message,
-                    retryCount: (message.retryCount || 0) + 1,
-                    lastAttempt: Date.now()
-                });
-
-                // Jika sudah mencoba lebih dari 3 kali, hapus dari queue
-                if ((message.retryCount || 0) >= 3) {
+                // Jika gagal, tambahkan kembali ke queue dengan timestamp dan retry count
+                if ((message.retryCount || 0) < 3) {
+                    connectionState.messageQueue.push({
+                        ...message,
+                        retryCount: (message.retryCount || 0) + 1,
+                        lastAttempt: Date.now()
+                    });
+                } else {
                     logger.warn(`Message to ${message.to} removed from queue after 3 failed attempts`);
-                    continue;
                 }
             }
         }
 
-        // Simpan state setelah selesai memproses
         saveConnectionState();
     } catch (error) {
         logger.error('Error handling failed messages:', error);
-        // Jangan throw error, biarkan aplikasi tetap berjalan
     }
 };
 
@@ -611,24 +624,16 @@ async function connectToWhatsApp() {
             logger: log({ level: "silent" }),
             version,
             shouldIgnoreJid: jid => isJidBroadcast(jid),
-            connectTimeoutMs: 120000,
-            defaultQueryTimeoutMs: 120000,
-            retryRequestDelayMs: 500,
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            retryRequestDelayMs: 250,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 15000,
+            keepAliveIntervalMs: 30000,
             emitOwnEvents: true,
             generateHighQualityLinkPreview: true,
             browser: ['Chrome (Linux)', '', ''],
             getMessage: async () => {
                 return { conversation: "Hello" }
-            },
-            printQRInTerminal: true,
-            auth: {
-                ...state,
-                creds: {
-                    ...state.creds,
-                    saveCreds: true
-                }
             }
         });
 
@@ -730,11 +735,6 @@ const isConnected = () => {
 
 // Optimasi fungsi handleReconnection
 const handleReconnection = async () => {
-    if (connectionState.isConnecting) {
-        logger.info('Reconnection already in progress, skipping...');
-        return false;
-    }
-
     const now = Date.now();
     if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 10000) {
         logger.info('Too soon to attempt reconnection, skipping...');
@@ -753,7 +753,6 @@ const handleReconnection = async () => {
                 // Tunggu lebih lama sebelum mencoba ping
                 await new Promise(resolve => setTimeout(resolve, 5000));
 
-                // Gunakan pesan random untuk ping
                 const pingMessage = getRandomPingMessage();
                 await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Koneksi WhatsApp masih aktif');
@@ -773,7 +772,7 @@ const handleReconnection = async () => {
 
         // Coba beberapa kali untuk memverifikasi koneksi
         let attempts = 0;
-        const maxAttempts = 5; // Increase max attempts
+        const maxAttempts = 5; // Meningkatkan jumlah percobaan
         let lastError = null;
 
         while (attempts < maxAttempts) {
@@ -781,14 +780,13 @@ const handleReconnection = async () => {
                 if (!sock?.user?.id) {
                     logger.warn('User ID tidak tersedia, mencoba lagi...');
                     attempts++;
-                    await new Promise(resolve => setTimeout(resolve, 5000)); // Increase delay
+                    await new Promise(resolve => setTimeout(resolve, 5000));
                     continue;
                 }
 
-                // Tunggu lebih lama sebelum mencoba mengirim pesan
-                await new Promise(resolve => setTimeout(resolve, 5000));
+                // Tunggu lebih lama sebelum verifikasi
+                await new Promise(resolve => setTimeout(resolve, 3000));
 
-                // Gunakan pesan random untuk verifikasi
                 const pingMessage = getRandomPingMessage();
                 await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Reconnect berhasil dan koneksi terverifikasi');
@@ -850,11 +848,12 @@ const resetSession = async () => {
             isConnecting: false,
             lastConnectionAttempt: null,
             reconnectAttempts: 0,
-            maxReconnectAttempts: 5,
+            maxReconnectAttempts: 10,
             isAuthenticated: false,
             lastConnectionTime: null,
             connectionStatus: 'disconnected',
-            messageQueue: []
+            messageQueue: [],
+            lastHeartbeat: null
         };
 
         // Hapus file connection state
@@ -1236,9 +1235,9 @@ io.on("connection", async (socket) => {
 
         // Implementasi heartbeat yang lebih robust
         let missedHeartbeats = 0;
-        const MAX_MISSED_HEARTBEATS = 3;
-        const HEARTBEAT_INTERVAL = 15000; // 15 detik
-        const HEARTBEAT_TIMEOUT = 5000; // 5 detik timeout
+        const MAX_MISSED_HEARTBEATS = 5;
+        const HEARTBEAT_INTERVAL = 30000; // Meningkatkan interval heartbeat ke 30 detik
+        const HEARTBEAT_TIMEOUT = 10000; // Meningkatkan timeout ke 10 detik
 
         const heartbeat = setInterval(() => {
             try {

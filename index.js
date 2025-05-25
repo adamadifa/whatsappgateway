@@ -300,113 +300,32 @@ const getRandomPingMessage = () => {
     return pingMessages[randomIndex];
 };
 
-// Tambahkan fungsi untuk validasi dan pembersihan session
-const validateAndCleanSession = async () => {
+// Fungsi untuk menyimpan state koneksi
+const saveConnectionState = () => {
     try {
-        logger.info('Validating and cleaning session...');
-
-        // Cek folder session
-        if (!fs.existsSync('baileys_auth_info')) {
-            fs.mkdirSync('baileys_auth_info', { recursive: true });
-            logger.info('Created session directory');
-            return false;
-        }
-
-        // Cek file session
-        const files = fs.readdirSync('baileys_auth_info');
-        if (files.length === 0) {
-            logger.info('No session files found');
-            return false;
-        }
-
-        // Validasi file session
-        const requiredFiles = ['creds.json', 'session-1.json'];
-        const missingFiles = requiredFiles.filter(file => !files.includes(file));
-
-        if (missingFiles.length > 0) {
-            logger.warn(`Missing required session files: ${missingFiles.join(', ')}`);
-            return false;
-        }
-
-        // Cek umur session
-        const credsPath = path.join('baileys_auth_info', 'creds.json');
-        if (fs.existsSync(credsPath)) {
-            const stats = fs.statSync(credsPath);
-            const sessionAge = Date.now() - stats.mtime.getTime();
-            const MAX_SESSION_AGE = 7 * 24 * 60 * 60 * 1000; // 7 hari
-
-            if (sessionAge > MAX_SESSION_AGE) {
-                logger.warn('Session is too old, cleaning up...');
-                await handleLogout();
-                return false;
-            }
-        }
-
-        return true;
+        const state = {
+            isAuthenticated: connectionState.isAuthenticated,
+            lastConnectionTime: connectionState.lastConnectionTime,
+            connectionStatus: connectionState.connectionStatus
+        };
+        fs.writeFileSync('connection_state.json', JSON.stringify(state));
     } catch (error) {
-        logger.error('Error validating session:', error);
-        return false;
+        console.error('Error saving connection state:', error);
+        // Jangan throw error, biarkan aplikasi tetap berjalan
     }
 };
 
-// Optimasi fungsi loadConnectionState
-const loadConnectionState = async () => {
+// Fungsi untuk memuat state koneksi
+const loadConnectionState = () => {
     try {
-        // Validasi session terlebih dahulu
-        const isValidSession = await validateAndCleanSession();
-        if (!isValidSession) {
-            logger.warn('Invalid session detected, resetting state');
-            connectionState = {
-                isConnecting: false,
-                lastConnectionAttempt: null,
-                reconnectAttempts: 0,
-                maxReconnectAttempts: 10,
-                isAuthenticated: false,
-                lastConnectionTime: null,
-                connectionStatus: 'disconnected',
-                messageQueue: [],
-                lastHeartbeat: null
-            };
-            return;
-        }
-
         if (fs.existsSync('connection_state.json')) {
             const state = JSON.parse(fs.readFileSync('connection_state.json'));
-
-            // Validasi state
-            if (state.lastConnectionTime) {
-                const connectionAge = Date.now() - state.lastConnectionTime;
-                const MAX_CONNECTION_AGE = 24 * 60 * 60 * 1000; // 24 jam
-
-                if (connectionAge > MAX_CONNECTION_AGE) {
-                    logger.warn('Connection state is too old, resetting...');
-                    connectionState = {
-                        isConnecting: false,
-                        lastConnectionAttempt: null,
-                        reconnectAttempts: 0,
-                        maxReconnectAttempts: 10,
-                        isAuthenticated: false,
-                        lastConnectionTime: null,
-                        connectionStatus: 'disconnected',
-                        messageQueue: [],
-                        lastHeartbeat: null
-                    };
-                    return;
-                }
-            }
-
-            // Update state dengan validasi
-            connectionState.isAuthenticated = state.isAuthenticated && isValidSession;
+            connectionState.isAuthenticated = state.isAuthenticated;
             connectionState.lastConnectionTime = state.lastConnectionTime;
             connectionState.connectionStatus = state.connectionStatus;
-
-            // Reset jika status tidak valid
-            if (!['connected', 'connecting', 'disconnected'].includes(connectionState.connectionStatus)) {
-                connectionState.connectionStatus = 'disconnected';
-            }
         }
     } catch (error) {
-        logger.error('Error loading connection state:', error);
+        console.error('Error loading connection state:', error);
         // Reset ke default state jika terjadi error
         connectionState = {
             isConnecting: false,
@@ -419,29 +338,6 @@ const loadConnectionState = async () => {
             messageQueue: [],
             lastHeartbeat: null
         };
-    }
-};
-
-// Optimasi fungsi saveConnectionState
-const saveConnectionState = () => {
-    try {
-        const state = {
-            isAuthenticated: connectionState.isAuthenticated,
-            lastConnectionTime: connectionState.lastConnectionTime,
-            connectionStatus: connectionState.connectionStatus,
-            lastHeartbeat: connectionState.lastHeartbeat
-        };
-
-        // Validasi sebelum menyimpan
-        if (state.lastConnectionTime && Date.now() - state.lastConnectionTime > 24 * 60 * 60 * 1000) {
-            logger.warn('Connection state is too old, not saving');
-            return;
-        }
-
-        fs.writeFileSync('connection_state.json', JSON.stringify(state));
-        logger.info('Connection state saved successfully');
-    } catch (error) {
-        logger.error('Error saving connection state:', error);
     }
 };
 
@@ -714,19 +610,10 @@ app.get('/logs/latest', (req, res) => {
     });
 });
 
-// Modifikasi fungsi connectToWhatsApp
+// Fungsi untuk koneksi ke WhatsApp
 async function connectToWhatsApp() {
     try {
         logger.info('Starting WhatsApp connection...');
-
-        // Validasi session sebelum koneksi
-        const isValidSession = await validateAndCleanSession();
-        if (!isValidSession) {
-            logger.warn('Invalid session detected, starting fresh connection');
-            connectionState.isAuthenticated = false;
-            connectionState.connectionStatus = 'disconnected';
-        }
-
         const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
         let { version, isLatest } = await fetchLatestBaileysVersion();
 
@@ -741,7 +628,7 @@ async function connectToWhatsApp() {
             defaultQueryTimeoutMs: 60000,
             retryRequestDelayMs: 250,
             markOnlineOnConnect: true,
-            keepAliveIntervalMs: 15000, // Meningkatkan frekuensi keepAlive
+            keepAliveIntervalMs: 30000,
             emitOwnEvents: true,
             generateHighQualityLinkPreview: true,
             browser: ['Chrome (Linux)', '', ''],
@@ -752,31 +639,14 @@ async function connectToWhatsApp() {
 
         sock.multi = true;
 
-        // Tambahkan sistem heartbeat yang lebih agresif
-        const heartbeatInterval = setInterval(async () => {
-            try {
-                if (sock?.user?.id) {
-                    await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
-                    connectionState.lastHeartbeat = Date.now();
-                    logger.info('Heartbeat sent successfully');
-                }
-            } catch (error) {
-                logger.warn('Heartbeat failed, attempting reconnect...', error);
-                clearInterval(heartbeatInterval);
-                await handleReconnection();
-            }
-        }, 30000); // Kirim heartbeat setiap 30 detik
-
         // Tambahkan error handler untuk socket
         sock.ev.on('error', async (err) => {
             logger.error('WhatsApp socket error:', err);
-            clearInterval(heartbeatInterval);
             if (!connectionState.isConnecting) {
                 await handleReconnection();
             }
         });
 
-        // Optimasi connection.update handler
         sock.ev.on('connection.update', async (update) => {
             try {
                 const { connection, lastDisconnect } = update;
@@ -786,8 +656,6 @@ async function connectToWhatsApp() {
                     const statusCode = lastDisconnect?.error?.output?.statusCode;
                     connectionState.connectionStatus = 'disconnected';
                     logger.warn(`Connection closed with status code: ${statusCode}`);
-
-                    clearInterval(heartbeatInterval);
 
                     if (statusCode === DisconnectReason.badSession) {
                         logger.error(`Bad Session File, Please Delete ${session} and Scan Again`);
@@ -811,14 +679,11 @@ async function connectToWhatsApp() {
                         await handleReconnection();
                     }
                 } else if (connection === 'open') {
-                    // Verifikasi koneksi lebih ketat
+                    // Verifikasi koneksi sebelum menganggap terhubung
                     try {
                         if (sock?.user?.id) {
-                            // Kirim beberapa ping untuk memastikan koneksi stabil
-                            for (let i = 0; i < 3; i++) {
-                                await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
-                                await new Promise(resolve => setTimeout(resolve, 1000));
-                            }
+                            const pingMessage = getRandomPingMessage();
+                            await sock.sendMessage(sock.user.id, { text: pingMessage });
 
                             logger.success('Connection opened and verified successfully');
                             connectionState.reconnectAttempts = 0;
@@ -884,7 +749,7 @@ const isConnected = () => {
 // Optimasi fungsi handleReconnection
 const handleReconnection = async () => {
     const now = Date.now();
-    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 5000) {
+    if (connectionState.lastConnectionAttempt && (now - connectionState.lastConnectionAttempt) < 10000) {
         logger.info('Too soon to attempt reconnection, skipping...');
         return false;
     }
@@ -898,12 +763,11 @@ const handleReconnection = async () => {
         // Cek apakah user sudah logout
         if (sock?.user?.id) {
             try {
-                // Kirim beberapa ping untuk memastikan koneksi stabil
-                for (let i = 0; i < 3; i++) {
-                    await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
+                // Tunggu lebih lama sebelum mencoba ping
+                await new Promise(resolve => setTimeout(resolve, 5000));
 
+                const pingMessage = getRandomPingMessage();
+                await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Koneksi WhatsApp masih aktif');
                 connectionState.connectionStatus = 'connected';
                 connectionState.isConnecting = false;
@@ -917,11 +781,11 @@ const handleReconnection = async () => {
         await connectToWhatsApp();
 
         // Tunggu lebih lama untuk memastikan koneksi terbentuk
-        await new Promise(resolve => setTimeout(resolve, 10000));
+        await new Promise(resolve => setTimeout(resolve, 15000));
 
         // Coba beberapa kali untuk memverifikasi koneksi
         let attempts = 0;
-        const maxAttempts = 5;
+        const maxAttempts = 5; // Meningkatkan jumlah percobaan
         let lastError = null;
 
         while (attempts < maxAttempts) {
@@ -929,16 +793,15 @@ const handleReconnection = async () => {
                 if (!sock?.user?.id) {
                     logger.warn('User ID tidak tersedia, mencoba lagi...');
                     attempts++;
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    await new Promise(resolve => setTimeout(resolve, 5000));
                     continue;
                 }
 
-                // Kirim beberapa ping untuk memastikan koneksi stabil
-                for (let i = 0; i < 3; i++) {
-                    await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
+                // Tunggu lebih lama sebelum verifikasi
+                await new Promise(resolve => setTimeout(resolve, 3000));
 
+                const pingMessage = getRandomPingMessage();
+                await sock.sendMessage(sock.user.id, { text: pingMessage });
                 logger.success('Reconnect berhasil dan koneksi terverifikasi');
                 connectionState.connectionStatus = 'connected';
                 connectionState.reconnectAttempts = 0;
@@ -953,7 +816,8 @@ const handleReconnection = async () => {
                 logger.warn(`Percobaan verifikasi koneksi ${attempts}/${maxAttempts} gagal:`, error);
 
                 if (attempts < maxAttempts) {
-                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    // Tunggu lebih lama sebelum mencoba lagi
+                    await new Promise(resolve => setTimeout(resolve, 5000));
                 }
             }
         }
@@ -1048,48 +912,18 @@ app.post("/send-message", async (req, res) => {
 
         numberWA = '62' + number.substring(1) + "@s.whatsapp.net";
 
-        // Coba koneksi ulang jika tidak terhubung
         if (!isConnected()) {
-            logger.info('Koneksi terputus, mencoba koneksi ulang...');
-            const reconnectSuccess = await handleReconnection();
-
-            if (!reconnectSuccess) {
-                // Jika gagal reconnect, simpan ke queue
-                connectionState.messageQueue.push({
-                    to: numberWA,
-                    content: { text: pesankirim }
-                });
-                return res.status(200).json({
-                    status: true,
-                    response: 'Pesan akan dikirim setelah koneksi tersedia'
-                });
-            }
+            // Simpan pesan ke queue jika tidak terhubung
+            connectionState.messageQueue.push({
+                to: numberWA,
+                content: { text: pesankirim }
+            });
+            return res.status(200).json({
+                status: true,
+                response: 'Pesan akan dikirim setelah koneksi tersedia'
+            });
         }
 
-        // Verifikasi koneksi dengan ping
-        try {
-            if (sock?.user?.id) {
-                await sock.sendMessage(sock.user.id, { text: getRandomPingMessage() });
-            } else {
-                throw new Error('User ID tidak tersedia');
-            }
-        } catch (error) {
-            logger.warn('Verifikasi koneksi gagal, mencoba koneksi ulang...', error);
-            const reconnectSuccess = await handleReconnection();
-
-            if (!reconnectSuccess) {
-                connectionState.messageQueue.push({
-                    to: numberWA,
-                    content: { text: pesankirim }
-                });
-                return res.status(200).json({
-                    status: true,
-                    response: 'Pesan akan dikirim setelah koneksi tersedia'
-                });
-            }
-        }
-
-        // Cek nomor WhatsApp
         const exists = await sock.onWhatsApp(numberWA);
         if (!exists?.jid && !(exists && exists[0]?.jid)) {
             return res.status(500).json({
@@ -1107,40 +941,12 @@ app.post("/send-message", async (req, res) => {
                     response: result
                 });
             } catch (error) {
-                logger.error('Gagal mengirim pesan:', error);
-
-                // Coba koneksi ulang jika gagal kirim
-                const reconnectSuccess = await handleReconnection();
-                if (reconnectSuccess) {
-                    // Coba kirim ulang setelah reconnect berhasil
-                    try {
-                        const result = await sock.sendMessage(exists.jid || exists[0].jid, { text: pesankirim });
-                        return res.status(200).json({
-                            status: true,
-                            response: result
-                        });
-                    } catch (retryError) {
-                        logger.error('Gagal mengirim pesan setelah reconnect:', retryError);
-                        connectionState.messageQueue.push({
-                            to: exists.jid || exists[0].jid,
-                            content: { text: pesankirim }
-                        });
-                        return res.status(200).json({
-                            status: true,
-                            response: 'Pesan akan dikirim setelah koneksi tersedia'
-                        });
-                    }
-                } else {
-                    // Simpan ke queue jika reconnect gagal
-                    connectionState.messageQueue.push({
-                        to: exists.jid || exists[0].jid,
-                        content: { text: pesankirim }
-                    });
-                    return res.status(200).json({
-                        status: true,
-                        response: 'Pesan akan dikirim setelah koneksi tersedia'
-                    });
-                }
+                // Simpan pesan ke queue jika gagal
+                connectionState.messageQueue.push({
+                    to: exists.jid || exists[0].jid,
+                    content: { text: pesankirim }
+                });
+                throw error;
             }
         }
 
@@ -1148,7 +954,7 @@ app.post("/send-message", async (req, res) => {
         // ... existing file handling code ...
 
     } catch (err) {
-        logger.error('Error sending message:', err);
+        console.error('Error sending message:', err);
         return res.status(500).json({
             status: false,
             response: err.message || 'Error sending message'
